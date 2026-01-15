@@ -1,0 +1,1830 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import time
+from contextlib import AsyncExitStack
+from dataclasses import dataclass, field, replace
+from hashlib import sha256
+from pathlib import Path
+from typing import Any
+
+from .agent_surface import SpecStatusSummary, build_agent_surface
+from .approval import ApprovalDecision, ApprovalRecord, ApprovalStatus
+from .context_mgmt import (
+    approx_tokens_from_json,
+    canonical_request_to_dict,
+    compute_context_left_percent,
+    resolve_context_limit_tokens,
+)
+from .error_codes import ErrorCode
+from .event_bus import EventBus
+from .ids import new_id, now_ts_ms
+from .llm.config import ModelConfig
+from .llm.errors import CancellationToken, ModelResolutionError
+from .llm.router import ModelRouter
+from .llm.types import (
+    CanonicalMessage,
+    CanonicalMessageRole,
+    CanonicalRequest,
+    LLMResponse,
+    LLMUsage,
+    ModelRequirements,
+    ModelRole,
+    ToolCall,
+    ToolSpec,
+)
+from .orchestrator_helpers import _canonical_request_to_redacted_dict, _summarize_text, _tool_calls_from_payload
+from .plan import PlanStore
+from .protocol import ArtifactRef, Event, EventKind, Op, OpKind
+from .run_snapshots import PendingToolCall as SnapshotPendingToolCall
+from .run_snapshots import RunSnapshot, delete_run_snapshot, read_run_snapshot, write_run_snapshot
+from .skills import SkillStore
+from .snapshots import GitSnapshotBackend
+from .spec_workflow import SpecProposalStore, SpecStateStore, SpecStore
+from .stores import ApprovalStore, ArtifactStore, EventLogStore, SessionStore
+from .mcp.config import load_mcp_config
+from .tools import (
+    ProjectAIGCDetectTool,
+    ProjectApplyEditsTool,
+    ProjectApplyPatchTool,
+    ProjectGlobTool,
+    ProjectListDirTool,
+    ProjectReadTextManyTool,
+    ProjectReadTextTool,
+    ProjectSearchTextTool,
+    ProjectTextStatsTool,
+    SessionExportTool,
+    SessionSearchTool,
+    ShellRunTool,
+    SkillListTool,
+    SkillLoadTool,
+    SkillReadFileTool,
+    SnapshotCreateTool,
+    SnapshotDiffTool,
+    SnapshotListTool,
+    SnapshotReadTextTool,
+    SnapshotRollbackTool,
+    SpecApplyTool,
+    SpecGetTool,
+    SpecProposeTool,
+    SpecQueryTool,
+    SpecSealTool,
+    ToolRegistry,
+    UpdatePlanTool,
+    WebFetchTool,
+    WebSearchTool,
+)
+from .tools.runtime import (
+    InspectionDecision,
+    PlannedToolCall,
+    ToolExecutionContext,
+    ToolRuntime,
+    _classify_tool_exception,
+)
+
+from .engine import PendingToolCall, RunResult, ToolDecision
+
+
+def _load_default_system_prompt() -> str:
+    try:
+        import importlib.resources
+
+        return (
+            importlib.resources.files("aura.runtime")
+            .joinpath("prompts/system_main.md")
+            .read_text(encoding="utf-8", errors="replace")
+        )
+    except Exception:
+        return "You are Aura, a terminal-based agent.\n"
+
+
+def _agno_usage_to_aura_usage(metrics: Any) -> LLMUsage | None:
+    if metrics is None:
+        return None
+
+    def _int_or_none(val: Any) -> int | None:
+        if isinstance(val, bool) or not isinstance(val, int):
+            return None
+        if val <= 0:
+            return None
+        return int(val)
+
+    return LLMUsage(
+        input_tokens=_int_or_none(getattr(metrics, "input_tokens", None)),
+        output_tokens=_int_or_none(getattr(metrics, "output_tokens", None)),
+        total_tokens=_int_or_none(getattr(metrics, "total_tokens", None)),
+        cache_creation_input_tokens=_int_or_none(getattr(metrics, "cache_write_tokens", None)),
+        cache_read_input_tokens=_int_or_none(getattr(metrics, "cache_read_tokens", None)),
+    )
+
+
+def _resolve_api_key(profile: Any) -> str | None:
+    cred = getattr(profile, "credential_ref", None)
+    if cred is None:
+        return None
+    kind = getattr(cred, "kind", None)
+    identifier = getattr(cred, "identifier", None)
+    if kind == "inline" and isinstance(identifier, str) and identifier.strip():
+        return identifier.strip()
+    return None
+
+
+@dataclass(slots=True)
+class AgnoAsyncEngine:
+    project_root: Path
+    session_id: str
+    event_bus: EventBus
+    session_store: SessionStore
+    event_log_store: EventLogStore
+    artifact_store: ArtifactStore
+    approval_store: ApprovalStore
+    model_config: ModelConfig
+    system_prompt: str | None = None
+    tools_enabled: bool = False
+    max_tool_turns: int = 30
+    tool_registry: ToolRegistry | None = None
+    tool_runtime: ToolRuntime | None = None
+    memory_summary: str | None = None
+    schema_version: str = "0.2"
+
+    model_router: ModelRouter = field(init=False)
+    skill_store: SkillStore = field(init=False)
+    plan_store: PlanStore = field(init=False)
+    spec_store: SpecStore = field(init=False)
+    spec_state_store: SpecStateStore = field(init=False)
+    spec_proposal_store: SpecProposalStore = field(init=False)
+    snapshot_backend: GitSnapshotBackend = field(init=False)
+
+    _history: list[CanonicalMessage] | None = field(default=None, init=False)
+    # Knowledge / RAG is implemented as an optional module and is not enabled by default.
+    _knowledge: Any | None = field(default=None, init=False, repr=False)
+    # ========== Multi-Surface extension point ==========
+    # Current CLI subscribes to EventBus directly.
+    # Future Web/Plugin/Cloud surfaces should follow `aura/runtime/surface.py`.
+    _auto_compact_seen_turn_ids: set[str] = field(default_factory=set, init=False, repr=False)
+    _event_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False, repr=False)
+    _event_sequence: int = field(default=0, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self.project_root = self.project_root.expanduser().resolve()
+        self.model_router = ModelRouter(self.model_config)
+        self.skill_store = SkillStore(project_root=self.project_root)
+        self.plan_store = PlanStore(session_store=self.session_store, session_id=self.session_id)
+        self.spec_store = SpecStore(project_root=self.project_root)
+        self.spec_state_store = SpecStateStore(project_root=self.project_root)
+        self.spec_proposal_store = SpecProposalStore(project_root=self.project_root)
+        self.snapshot_backend = GitSnapshotBackend(project_root=self.project_root)
+
+        if self.max_tool_turns < 1:
+            raise ValueError("max_tool_turns must be >= 1")
+        if self.max_tool_turns > 256:
+            raise ValueError("max_tool_turns must be <= 256")
+
+        registry = ToolRegistry()
+        registry.register(ProjectReadTextTool())
+        registry.register(ProjectApplyEditsTool())
+        registry.register(ProjectApplyPatchTool())
+        registry.register(ProjectSearchTextTool())
+        registry.register(ProjectListDirTool())
+        registry.register(ProjectGlobTool())
+        registry.register(ProjectReadTextManyTool())
+        registry.register(ProjectTextStatsTool())
+        registry.register(ProjectAIGCDetectTool())
+        registry.register(ShellRunTool())
+        registry.register(WebFetchTool())
+        registry.register(WebSearchTool())
+        registry.register(SessionSearchTool())
+        registry.register(SessionExportTool())
+        registry.register(SkillListTool(self.skill_store))
+        registry.register(SkillLoadTool(self.skill_store))
+        registry.register(SkillReadFileTool(self.skill_store))
+        registry.register(UpdatePlanTool(self.plan_store))
+        registry.register(SpecQueryTool(self.spec_store))
+        registry.register(SpecGetTool(self.spec_store))
+        registry.register(
+            SpecProposeTool(self.spec_store, self.spec_proposal_store, self.spec_state_store, self.artifact_store)
+        )
+        registry.register(SpecApplyTool(self.spec_proposal_store, self.spec_state_store))
+        registry.register(SpecSealTool(self.spec_state_store, self.snapshot_backend))
+        registry.register(SnapshotListTool(self.snapshot_backend))
+        registry.register(SnapshotCreateTool(self.snapshot_backend))
+        registry.register(SnapshotReadTextTool(self.snapshot_backend))
+        registry.register(SnapshotDiffTool(self.snapshot_backend))
+        registry.register(SnapshotRollbackTool(self.snapshot_backend))
+
+        tool_runtime = ToolRuntime(project_root=self.project_root, registry=registry, artifact_store=self.artifact_store)
+
+        try:
+            from .tools.subagent_runner import SubagentRunTool
+
+            registry.register(
+                SubagentRunTool(
+                    model_router=self.model_router,
+                    tool_registry=registry,
+                    tool_runtime=tool_runtime,
+                    artifact_store=self.artifact_store,
+                )
+            )
+        except Exception:
+            pass
+
+        self.tool_registry = registry
+        self.tool_runtime = tool_runtime
+
+        # Initialize event sequence from the last persisted event (best-effort).
+        last = 0
+        try:
+            for evt in self.event_log_store.read(self.session_id):
+                if isinstance(evt.sequence, int) and evt.sequence > last:
+                    last = evt.sequence
+        except Exception:
+            last = 0
+        self._event_sequence = last
+
+    def set_chat_model_profile(self, profile_id: str) -> None:
+        if profile_id not in self.model_config.profiles:
+            raise ValueError(f"Unknown model profile: {profile_id}")
+        cfg = ModelConfig(
+            profiles=dict(self.model_config.profiles),
+            role_pointers={ModelRole.MAIN: profile_id},
+        )
+        cfg.validate_consistency()
+        self.model_config = cfg
+        self.model_router = ModelRouter(cfg)
+
+    def load_history_from_events(self) -> None:
+        history: list[CanonicalMessage] = []
+
+        def _read_artifact_text(ref_dict: dict[str, Any]) -> str:
+            ref = ArtifactRef.from_dict(ref_dict)
+            data = self.artifact_store.get(ref)
+            return data.decode("utf-8", errors="replace")
+
+        for event in self.event_log_store.read(self.session_id):
+            if event.kind == EventKind.OPERATION_STARTED.value:
+                ref_raw = event.payload.get("input_ref")
+                if isinstance(ref_raw, dict):
+                    text = _read_artifact_text(ref_raw)
+                    history.append(CanonicalMessage(role=CanonicalMessageRole.USER, content=text))
+            elif event.kind == EventKind.LLM_RESPONSE_COMPLETED.value:
+                subagent_run_id = event.payload.get("subagent_run_id")
+                if isinstance(subagent_run_id, str) and subagent_run_id:
+                    continue
+                if event.payload.get("op_kind") == OpKind.COMPACT.value:
+                    # Compaction runs are internal and must not be rehydrated into chat history.
+                    continue
+                ref_raw = event.payload.get("output_ref")
+                if isinstance(ref_raw, dict):
+                    text = _read_artifact_text(ref_raw)
+                    tool_calls = _tool_calls_from_payload(
+                        event.payload.get("tool_calls"),
+                        read_artifact_text=_read_artifact_text,
+                    )
+                    history.append(
+                        CanonicalMessage(
+                            role=CanonicalMessageRole.ASSISTANT,
+                            content=text,
+                            tool_calls=tool_calls or None,
+                        )
+                    )
+            elif event.kind == EventKind.TOOL_CALL_END.value:
+                subagent_run_id = event.payload.get("subagent_run_id")
+                if isinstance(subagent_run_id, str) and subagent_run_id:
+                    continue
+                payload = event.payload
+                tool_call_id = payload.get("tool_call_id")
+                tool_name = payload.get("tool_name")
+                ref_raw = payload.get("tool_message_ref")
+                if (
+                    isinstance(tool_call_id, str)
+                    and tool_call_id
+                    and isinstance(tool_name, str)
+                    and tool_name
+                    and isinstance(ref_raw, dict)
+                ):
+                    content = _read_artifact_text(ref_raw)
+                    history.append(
+                        CanonicalMessage(
+                            role=CanonicalMessageRole.TOOL,
+                            content=content,
+                            tool_call_id=tool_call_id,
+                            tool_name=tool_name,
+                        )
+                    )
+
+        self._history = history
+
+    def apply_memory_summary_retention(self) -> None:
+        if self._history is None:
+            self._history = []
+        if not (isinstance(self.memory_summary, str) and self.memory_summary.strip()):
+            return
+        profile = self.model_config.get_profile_for_role(ModelRole.MAIN)
+        if profile is None:
+            return
+        try:
+            from .compaction import apply_compaction_retention, settings_for_profile
+        except Exception:
+            return
+        cm = settings_for_profile(profile)
+        context_limit_tokens = resolve_context_limit_tokens(
+            profile.limits.context_limit_tokens if profile.limits is not None else None
+        )
+        retained = apply_compaction_retention(
+            history=list(self._history),
+            memory_summary=self.memory_summary.strip(),
+            context_limit_tokens=context_limit_tokens,
+            history_budget_ratio=cm.history_budget_ratio,
+            history_budget_fallback_tokens=cm.history_budget_fallback_tokens,
+        )
+        self.memory_summary = retained.memory_summary
+        self._history = list(retained.retained_history)
+
+    async def arun(
+        self,
+        op: Op,
+        *,
+        timeout_s: float | None = None,
+        cancel: CancellationToken | None = None,
+    ) -> RunResult:
+        if op.session_id != self.session_id:
+            raise ValueError("Op session_id does not match engine session.")
+
+        if op.kind == OpKind.APPROVAL_DECISION.value:
+            return await self._arun_approval_decision(op, timeout_s=timeout_s, cancel=cancel)
+
+        pending = self.approval_store.list(session_id=self.session_id, status=ApprovalStatus.PENDING)
+        if pending:
+            return RunResult(
+                status="needs_approval",
+                run_id=str(pending[0].request_id),
+                session_id=self.session_id,
+                approval_id=pending[0].approval_id,
+                pending_tools=[],
+                error="Session has pending approvals.",
+            )
+
+        if op.kind == OpKind.CHAT.value:
+            return await self._arun_chat(op, timeout_s=timeout_s, cancel=cancel)
+
+        if op.kind == OpKind.COMPACT.value:
+            ok = await self._perform_compaction(
+                trigger="manual",
+                request_id=op.request_id,
+                turn_id=op.turn_id,
+                timeout_s=timeout_s,
+                cancel=cancel,
+                extra_tools=None,
+            )
+            if ok:
+                return RunResult(status="completed", run_id=op.request_id, session_id=self.session_id)
+            return RunResult(status="failed", run_id=op.request_id, session_id=self.session_id, error="compact_failed")
+
+        await self._emit(
+            kind=EventKind.OPERATION_FAILED,
+            payload={"error": f"Unsupported op kind: {op.kind}", "error_code": ErrorCode.BAD_REQUEST.value},
+            request_id=op.request_id,
+            turn_id=op.turn_id,
+            step_id=None,
+        )
+        return RunResult(status="failed", run_id=op.request_id, session_id=self.session_id, error="unsupported_op")
+
+    async def continue_run(
+        self,
+        *,
+        run_id: str,
+        decisions: list[ToolDecision],
+        timeout_s: float | None = None,
+        cancel: CancellationToken | None = None,
+    ) -> RunResult:
+        snapshot = read_run_snapshot(project_root=self.project_root, run_id=run_id)
+        if snapshot.session_id != self.session_id:
+            raise ValueError("Run snapshot session mismatch.")
+        if snapshot.model_profile_id:
+            try:
+                self.set_chat_model_profile(snapshot.model_profile_id)
+            except Exception:
+                pass
+        self._history = list(snapshot.messages)
+        turn_id = snapshot.turn_id
+
+        decision_map: dict[str, ToolDecision] = {d.tool_call_id: d for d in decisions if d.tool_call_id}
+        pending = list(snapshot.pending_tools)
+
+        # Clear approvals if all required decisions are present.
+        approval_id = snapshot.approval_id
+        if approval_id:
+            try:
+                record = self.approval_store.get(approval_id)
+                if record.status is ApprovalStatus.PENDING:
+                    record_decision = {
+                        "decisions": [
+                            {"tool_call_id": d.tool_call_id, "decision": d.decision, "note": d.note}
+                            for d in decisions
+                        ],
+                        "decided_at": now_ts_ms(),
+                    }
+                    status = ApprovalStatus.GRANTED if any(d.decision == "approve" for d in decisions) else ApprovalStatus.DENIED
+                    updated = replace(record, status=status, decision=record_decision)
+                    self.approval_store.update(updated)
+            except Exception:
+                pass
+
+        result = await self._run_tool_loop(
+            request_id=run_id,
+            turn_id=turn_id,
+            pending_tools=pending,
+            decision_map=decision_map,
+            timeout_s=timeout_s,
+            cancel=cancel,
+        )
+        if result.status != "needs_approval":
+            delete_run_snapshot(project_root=self.project_root, run_id=run_id)
+        return result
+
+    async def _arun_chat(
+        self,
+        op: Op,
+        *,
+        timeout_s: float | None,
+        cancel: CancellationToken | None,
+    ) -> RunResult:
+        user_text = str(op.payload.get("text") or "")
+        if not user_text.strip():
+            await self._emit(
+                kind=EventKind.OPERATION_FAILED,
+                payload={"error": "Empty input.", "error_code": ErrorCode.BAD_REQUEST.value},
+                request_id=op.request_id,
+                turn_id=op.turn_id,
+                step_id=None,
+            )
+            return RunResult(status="failed", run_id=op.request_id, session_id=self.session_id, error="empty_input")
+
+        if self._history is None:
+            self._history = []
+
+        input_ref = self.artifact_store.put(user_text, kind="chat_user", meta={"summary": _summarize_text(user_text)})
+        await self._emit(
+            kind=EventKind.OPERATION_STARTED,
+            payload={"op_kind": OpKind.CHAT.value, "input_ref": input_ref.to_dict()},
+            request_id=op.request_id,
+            turn_id=op.turn_id,
+            step_id=None,
+        )
+        self._history.append(CanonicalMessage(role=CanonicalMessageRole.USER, content=user_text))
+
+        return await self._run_tool_loop(
+            request_id=op.request_id,
+            turn_id=op.turn_id,
+            pending_tools=None,
+            decision_map={},
+            timeout_s=timeout_s,
+            cancel=cancel,
+        )
+
+    async def _arun_approval_decision(
+        self,
+        op: Op,
+        *,
+        timeout_s: float | None,
+        cancel: CancellationToken | None,
+    ) -> RunResult:
+        approval_id = str(op.payload.get("approval_id") or "")
+        decision_raw = str(op.payload.get("decision") or "")
+        note = op.payload.get("note")
+
+        if not approval_id:
+            return RunResult(status="failed", run_id=op.request_id, session_id=self.session_id, error="missing_approval_id")
+
+        try:
+            record = self.approval_store.get(approval_id)
+        except FileNotFoundError:
+            return RunResult(status="failed", run_id=op.request_id, session_id=self.session_id, error="approval_not_found")
+
+        if record.session_id != self.session_id:
+            return RunResult(status="failed", run_id=op.request_id, session_id=self.session_id, error="approval_session_mismatch")
+
+        if record.status is not ApprovalStatus.PENDING:
+            return RunResult(status="failed", run_id=record.request_id, session_id=self.session_id, error="approval_not_pending")
+
+        try:
+            decision = ApprovalDecision(decision_raw)
+        except ValueError:
+            return RunResult(status="failed", run_id=record.request_id, session_id=self.session_id, error="approval_decision_invalid")
+
+        tool_calls = record.resume_payload.get("tool_calls") if isinstance(record.resume_payload, dict) else None
+        pending_ids: list[str] = []
+        if isinstance(tool_calls, list):
+            for c in tool_calls:
+                if not isinstance(c, dict):
+                    continue
+                tid = c.get("tool_call_id")
+                if isinstance(tid, str) and tid:
+                    pending_ids.append(tid)
+
+        if decision is ApprovalDecision.APPROVE:
+            decisions = [ToolDecision(tool_call_id=tid, decision="approve") for tid in pending_ids]
+        else:
+            decisions = [ToolDecision(tool_call_id=tid, decision="deny", note=str(note) if note is not None else None) for tid in pending_ids]
+
+        return await self.continue_run(run_id=record.request_id, decisions=decisions, timeout_s=timeout_s, cancel=cancel)
+
+    async def _run_tool_loop(
+        self,
+        *,
+        request_id: str,
+        turn_id: str | None,
+        pending_tools: list[SnapshotPendingToolCall] | None,
+        decision_map: dict[str, ToolDecision],
+        timeout_s: float | None,
+        cancel: CancellationToken | None,
+    ) -> RunResult:
+        cancel = cancel or CancellationToken()
+        if cancel.cancelled:
+            await self._emit(
+                kind=EventKind.OPERATION_CANCELLED,
+                payload={"op_kind": OpKind.CHAT.value, "error_code": ErrorCode.CANCELLED.value, "reason": "cancelled"},
+                request_id=request_id,
+                turn_id=turn_id,
+                step_id=None,
+            )
+            return RunResult(status="cancelled", run_id=request_id, session_id=self.session_id, error="cancelled")
+
+        if self._history is None:
+            self._history = []
+
+        if self.tool_registry is None or self.tool_runtime is None:
+            raise RuntimeError("Tool runtime not initialized.")
+
+        profile = None
+        try:
+            reqs = ModelRequirements(needs_tools=self.tools_enabled)
+            resolved = self.model_router.resolve(role=ModelRole.MAIN, requirements=reqs)
+            profile = resolved.profile
+        except ModelResolutionError as e:
+            await self._emit(
+                kind=EventKind.OPERATION_FAILED,
+                payload={"error": str(e), "error_code": ErrorCode.MODEL_RESOLUTION.value, "type": "model_resolution"},
+                request_id=request_id,
+                turn_id=turn_id,
+                step_id=None,
+            )
+            return RunResult(status="failed", run_id=request_id, session_id=self.session_id, error="model_resolution")
+
+        async with AsyncExitStack() as stack:
+            mcp_functions, mcp_specs = await self._load_mcp_tooling(stack=stack)
+
+            guard_id = str(turn_id or request_id)
+            while True:
+                # Build system prompt and tool surface (Aura tools + MCP tools).
+                request = self._build_request(extra_tools=mcp_specs)
+                context_limit_tokens = resolve_context_limit_tokens(
+                    profile.limits.context_limit_tokens if profile.limits is not None else None
+                )
+                estimated_input_tokens = approx_tokens_from_json(canonical_request_to_dict(request))
+                context_stats: dict[str, Any] = {
+                    "estimated_input_tokens": estimated_input_tokens,
+                    "estimate_kind": "bytes_per_token_4",
+                    "context_limit_tokens": context_limit_tokens,
+                }
+                if isinstance(context_limit_tokens, int) and context_limit_tokens > 0:
+                    context_stats["estimated_context_left_percent"] = compute_context_left_percent(
+                        used_tokens=estimated_input_tokens,
+                        context_limit_tokens=context_limit_tokens,
+                    )
+
+                # Auto-compaction guard (no extra "magic": only triggers via explicit config thresholds).
+                try:
+                    from .compaction import settings_for_profile, should_auto_compact
+
+                    cm = settings_for_profile(profile)
+                    threshold_ratio = cm.auto_compact_threshold_ratio
+                    if (
+                        guard_id
+                        and guard_id not in self._auto_compact_seen_turn_ids
+                        and should_auto_compact(
+                            estimated_input_tokens=estimated_input_tokens,
+                            context_limit_tokens=context_limit_tokens,
+                            threshold_ratio=threshold_ratio,
+                        )
+                    ):
+                        self._auto_compact_seen_turn_ids.add(guard_id)
+                        ok = await self._perform_compaction(
+                            trigger="auto",
+                            request_id=request_id,
+                            turn_id=turn_id,
+                            timeout_s=timeout_s,
+                            cancel=cancel,
+                            context_stats=context_stats,
+                            threshold_ratio=threshold_ratio,
+                            extra_tools=mcp_specs,
+                        )
+                        if not ok:
+                            return RunResult(status="failed", run_id=request_id, session_id=self.session_id, error="compact_failed")
+                        continue
+                except Exception:
+                    pass
+
+                break
+
+            # If we are resuming from a paused snapshot, execute those tools first.
+            if pending_tools:
+                pending_planned = []
+                for t in pending_tools:
+                    pending_planned.append(
+                        self.tool_runtime.plan(
+                            tool_execution_id=f"tool_{t.tool_call_id}",
+                            tool_name=t.tool_name,
+                            tool_call_id=t.tool_call_id,
+                            arguments=dict(t.args),
+                        )
+                    )
+
+                if await self._needs_more_approval(
+                    request_id=request_id,
+                    turn_id=turn_id,
+                    planned_calls=pending_planned,
+                    decision_map=decision_map,
+                    mcp_functions=mcp_functions,
+                    context_stats=context_stats,
+                    model_profile_id=getattr(profile, "profile_id", None),
+                ):
+                    return RunResult(
+                        status="needs_approval",
+                        run_id=request_id,
+                        session_id=self.session_id,
+                        approval_id=read_run_snapshot(project_root=self.project_root, run_id=request_id).approval_id,
+                        pending_tools=[
+                            PendingToolCall(tool_call_id=p.tool_call_id, tool_name=p.tool_name, args=dict(p.arguments))
+                            for p in pending_planned
+                        ],
+                    )
+
+                for planned in pending_planned:
+                    inspection = self._inspect_tool(planned=planned, mcp_functions=mcp_functions)
+                    tool_message = await self._execute_planned_after_decisions(
+                        planned=planned,
+                        inspection=inspection,
+                        decision=decision_map.get(planned.tool_call_id),
+                        request_id=request_id,
+                        turn_id=turn_id,
+                        mcp_functions=mcp_functions,
+                    )
+                    self._history.append(
+                        CanonicalMessage(
+                            role=CanonicalMessageRole.TOOL,
+                            content=tool_message,
+                            tool_call_id=planned.tool_call_id,
+                            tool_name=planned.tool_name,
+                        )
+                    )
+
+            # Main model/tool loop.
+            for _ in range(self.max_tool_turns):
+                step_id = new_id("step")
+                await self._emit(
+                    kind=EventKind.LLM_REQUEST_STARTED,
+                    payload={
+                        "role": ModelRole.MAIN.value,
+                        "context_ref": self._write_context_ref(request).to_dict(),
+                        "profile_id": getattr(profile, "profile_id", None),
+                        "timeout_s": timeout_s if timeout_s is not None else getattr(profile, "timeout_s", None),
+                        "stream": False,
+                        "context_stats": dict(context_stats),
+                        "agno_mode": "agent_external_tools",
+                    },
+                    request_id=request_id,
+                    turn_id=turn_id,
+                    step_id=step_id,
+                )
+
+                assistant_text, tool_calls = await self._run_agent_once(
+                    request=request,
+                    profile=profile,
+                    request_id=request_id,
+                    turn_id=turn_id,
+                    mcp_functions=mcp_functions,
+                )
+
+                planned_calls: list[PlannedToolCall] = []
+                if tool_calls:
+                    for tc in tool_calls:
+                        planned_calls.append(
+                            self.tool_runtime.plan(
+                                tool_execution_id=f"tool_{tc.tool_call_id or new_id('call')}",
+                                tool_name=tc.name,
+                                tool_call_id=str(tc.tool_call_id or new_id("call")),
+                                arguments=dict(tc.arguments),
+                            )
+                        )
+
+                await self._emit_llm_response_completed(
+                    final_response=LLMResponse(
+                        provider_kind=profile.provider_kind,
+                        profile_id=profile.profile_id,
+                        model=profile.model_name,
+                        text=assistant_text,
+                        tool_calls=[],
+                        usage=None,
+                        stop_reason=None,
+                        request_id=None,
+                    ),
+                    planned_calls=planned_calls,
+                    context_stats=context_stats,
+                    request_id=request_id,
+                    turn_id=turn_id,
+                    step_id=step_id,
+                    extra_payload={"stream": False, "agno_mode": "agent_external_tools"},
+                )
+
+                self._history.append(
+                    CanonicalMessage(
+                        role=CanonicalMessageRole.ASSISTANT,
+                        content=assistant_text,
+                        tool_calls=tool_calls or None,
+                    )
+                )
+
+                if not planned_calls:
+                    await self._emit(
+                        kind=EventKind.OPERATION_COMPLETED,
+                        payload={"op_kind": OpKind.CHAT.value},
+                        request_id=request_id,
+                        turn_id=turn_id,
+                        step_id=None,
+                    )
+                    return RunResult(status="completed", run_id=request_id, session_id=self.session_id)
+
+                if await self._needs_more_approval(
+                    request_id=request_id,
+                    turn_id=turn_id,
+                    planned_calls=planned_calls,
+                    decision_map={},
+                    mcp_functions=mcp_functions,
+                    context_stats=context_stats,
+                    model_profile_id=getattr(profile, "profile_id", None),
+                ):
+                    snap = read_run_snapshot(project_root=self.project_root, run_id=request_id)
+                    return RunResult(
+                        status="needs_approval",
+                        run_id=request_id,
+                        session_id=self.session_id,
+                        approval_id=snap.approval_id,
+                        pending_tools=[
+                            PendingToolCall(tool_call_id=p.tool_call_id, tool_name=p.tool_name, args=dict(p.arguments))
+                            for p in planned_calls
+                        ],
+                    )
+
+                for planned in planned_calls:
+                    inspection = self._inspect_tool(planned=planned, mcp_functions=mcp_functions)
+                    tool_message = await self._execute_planned_after_decisions(
+                        planned=planned,
+                        inspection=inspection,
+                        decision=None,
+                        request_id=request_id,
+                        turn_id=turn_id,
+                        mcp_functions=mcp_functions,
+                    )
+                    self._history.append(
+                        CanonicalMessage(
+                            role=CanonicalMessageRole.TOOL,
+                            content=tool_message,
+                            tool_call_id=planned.tool_call_id,
+                            tool_name=planned.tool_name,
+                        )
+                    )
+
+                request = self._build_request(extra_tools=mcp_specs)
+
+            await self._emit(
+                kind=EventKind.OPERATION_FAILED,
+                payload={"error": "Exceeded tool loop limit.", "error_code": ErrorCode.TOOL_LOOP_LIMIT.value},
+                request_id=request_id,
+                turn_id=turn_id,
+                step_id=None,
+            )
+            return RunResult(status="failed", run_id=request_id, session_id=self.session_id, error="tool_loop_limit")
+
+    async def _perform_compaction(
+        self,
+        *,
+        trigger: str,
+        request_id: str,
+        turn_id: str | None,
+        timeout_s: float | None,
+        cancel: CancellationToken | None,
+        context_stats: dict[str, Any] | None = None,
+        threshold_ratio: float | None = None,
+        extra_tools: list[ToolSpec] | None = None,
+    ) -> bool:
+        cancel = cancel or CancellationToken()
+        if cancel.cancelled:
+            await self._emit(
+                kind=EventKind.OPERATION_CANCELLED,
+                payload={
+                    "op_kind": OpKind.COMPACT.value,
+                    "error_code": ErrorCode.CANCELLED.value,
+                    "reason": "cancelled",
+                    "phase": "compact",
+                },
+                request_id=request_id,
+                turn_id=turn_id,
+                step_id=None,
+            )
+            return False
+
+        if self._history is None:
+            self._history = []
+
+        is_auto = trigger == "auto"
+        has_summary = isinstance(self.memory_summary, str) and self.memory_summary.strip()
+        if not self._history and not has_summary:
+            await self._emit(
+                kind=EventKind.OPERATION_FAILED,
+                payload={
+                    "op_kind": OpKind.COMPACT.value,
+                    "error": "Nothing to compact (empty history).",
+                    "error_code": ErrorCode.BAD_REQUEST.value,
+                    "type": "compact_empty",
+                },
+                request_id=request_id,
+                turn_id=turn_id,
+                step_id=None,
+            )
+            return False
+
+        before_count = len(self._history)
+        step_id = new_id("step")
+        await self._emit(
+            kind=EventKind.OPERATION_STARTED,
+            payload={
+                "op_kind": OpKind.COMPACT.value,
+                "trigger": trigger,
+                "context_stats": dict(context_stats or {}),
+                "threshold_ratio": threshold_ratio,
+            },
+            request_id=request_id,
+            turn_id=turn_id,
+            step_id=step_id,
+        )
+
+        profile = self.model_config.get_profile_for_role(ModelRole.EXTRACT) or self.model_config.get_profile_for_role(ModelRole.MAIN)
+        if profile is None:
+            await self._emit(
+                kind=EventKind.OPERATION_FAILED,
+                payload={
+                    "op_kind": OpKind.COMPACT.value,
+                    "error": "No model profile configured for compaction.",
+                    "error_code": ErrorCode.MODEL_RESOLUTION.value,
+                    "type": "compact_model_missing",
+                },
+                request_id=request_id,
+                turn_id=turn_id,
+                step_id=step_id,
+            )
+            return False
+
+        try:
+            from .compaction import apply_compaction_retention, build_compaction_request, load_compact_prompt_text, settings_for_profile
+        except Exception as e:
+            await self._emit(
+                kind=EventKind.OPERATION_FAILED,
+                payload={
+                    "op_kind": OpKind.COMPACT.value,
+                    "error": f"Compaction module unavailable: {e}",
+                    "error_code": ErrorCode.UNKNOWN.value,
+                    "type": "compact_import",
+                },
+                request_id=request_id,
+                turn_id=turn_id,
+                step_id=step_id,
+            )
+            return False
+
+        cm = settings_for_profile(profile)
+        context_limit_tokens = resolve_context_limit_tokens(profile.limits.context_limit_tokens if profile.limits is not None else None)
+
+        compact_prompt = load_compact_prompt_text()
+        compact_request = build_compaction_request(
+            history=list(self._history),
+            memory_summary=self.memory_summary,
+            prompt_text=compact_prompt,
+            tool_output_budget_tokens=cm.tool_output_budget_tokens,
+        )
+
+        await self._emit(
+            kind=EventKind.LLM_REQUEST_STARTED,
+            payload={
+                "role": ModelRole.EXTRACT.value,
+                "context_ref": self._write_context_ref(compact_request).to_dict(),
+                "profile_id": getattr(profile, "profile_id", None),
+                "timeout_s": timeout_s if timeout_s is not None else getattr(profile, "timeout_s", None),
+                "stream": False,
+                "agno_mode": "compact",
+            },
+            request_id=request_id,
+            turn_id=turn_id,
+            step_id=step_id,
+        )
+
+        try:
+            # Compaction is a plain text completion (no tools).
+            summary_text, _tool_calls = await self._run_agent_once(
+                request=compact_request,
+                profile=profile,
+                request_id=request_id,
+                turn_id=turn_id,
+                mcp_functions={},
+            )
+        except Exception as e:
+            await self._emit(
+                kind=EventKind.LLM_REQUEST_FAILED,
+                payload={
+                    "role": ModelRole.EXTRACT.value,
+                    "error": str(e),
+                    "error_code": ErrorCode.UNKNOWN.value,
+                },
+                request_id=request_id,
+                turn_id=turn_id,
+                step_id=step_id,
+            )
+            await self._emit(
+                kind=EventKind.OPERATION_FAILED,
+                payload={
+                    "op_kind": OpKind.COMPACT.value,
+                    "error": str(e),
+                    "error_code": ErrorCode.UNKNOWN.value,
+                    "type": "compact_llm",
+                },
+                request_id=request_id,
+                turn_id=turn_id,
+                step_id=step_id,
+            )
+            return False
+
+        raw_summary = str(summary_text or "").strip()
+        if not raw_summary:
+            raw_summary = "(empty summary)"
+
+        raw_summary_ref = self.artifact_store.put(
+            raw_summary,
+            kind="compact_raw_summary",
+            meta={"summary": "Compaction raw summary"},
+        )
+
+        retained = apply_compaction_retention(
+            history=list(self._history),
+            memory_summary=raw_summary,
+            context_limit_tokens=context_limit_tokens,
+            history_budget_ratio=cm.history_budget_ratio,
+            history_budget_fallback_tokens=cm.history_budget_fallback_tokens,
+        )
+
+        self.memory_summary = retained.memory_summary
+        self._history = list(retained.retained_history)
+        after_count = len(self._history)
+
+        summary_ref = self.artifact_store.put(
+            retained.memory_summary,
+            kind="compact_summary",
+            meta={"summary": "Compaction durable summary"},
+        )
+
+        snap = self.snapshot_backend.snapshot_create(reason=f"compaction:{trigger}")
+        snapshot_ref = self.artifact_store.put(
+            json.dumps({"commit": snap.commit, "label": snap.label}, ensure_ascii=False, sort_keys=True, indent=2),
+            kind="compact_snapshot",
+            meta={"summary": "Compaction snapshot"},
+        )
+
+        try:
+            patch: dict[str, Any] = {
+                "memory_summary": retained.memory_summary,
+                "last_compacted_at": now_ts_ms(),
+                "last_compaction_trigger": trigger,
+                "last_compaction_summary_ref": summary_ref.to_dict(),
+            }
+            if isinstance(context_stats, dict):
+                patch["last_compaction_context_stats"] = dict(context_stats)
+            self.session_store.update_session(self.session_id, patch)
+        except Exception:
+            pass
+
+        post_request = self._build_request(extra_tools=extra_tools)
+        post_estimated_input_tokens = approx_tokens_from_json(canonical_request_to_dict(post_request))
+        post_stats: dict[str, Any] = {
+            "estimated_input_tokens": post_estimated_input_tokens,
+            "estimate_kind": "bytes_per_token_4",
+            "context_limit_tokens": context_limit_tokens,
+        }
+        if isinstance(context_limit_tokens, int) and context_limit_tokens > 0:
+            post_stats["estimated_context_left_percent"] = compute_context_left_percent(
+                used_tokens=post_estimated_input_tokens,
+                context_limit_tokens=context_limit_tokens,
+            )
+
+        await self._emit(
+            kind=EventKind.OPERATION_COMPLETED,
+            payload={
+                "op_kind": OpKind.COMPACT.value,
+                "trigger": trigger,
+                "raw_summary_ref": raw_summary_ref.to_dict(),
+                "summary_ref": summary_ref.to_dict(),
+                "snapshot_ref": snapshot_ref.to_dict(),
+                "history_before_count": before_count,
+                "history_after_count": after_count,
+                "history_budget_tokens": retained.history_budget_tokens,
+                "summary_estimated_tokens": retained.summary_estimated_tokens,
+                "context_stats": post_stats,
+                "auto": bool(is_auto),
+            },
+            request_id=request_id,
+            turn_id=turn_id,
+            step_id=step_id,
+        )
+
+        return True
+
+    async def _run_agent_once(
+        self,
+        *,
+        request: CanonicalRequest,
+        profile: Any,
+        request_id: str,
+        turn_id: str | None,
+        mcp_functions: dict[str, Any],
+    ) -> tuple[str, list[ToolCall]]:
+        try:
+            from agno.agent.agent import Agent as AgnoAgent
+            from agno.models.message import Message as AgnoMessage
+            from agno.tools.function import Function as AgnoFunction
+        except Exception as e:
+            raise RuntimeError(f"Agno is not available: {e}") from e
+
+        agno_model = self._build_agno_model(profile)
+
+        input_messages: list[AgnoMessage] = []
+        if request.messages:
+            for msg in request.messages:
+                if msg.role is CanonicalMessageRole.SYSTEM:
+                    continue
+                if msg.role is CanonicalMessageRole.TOOL:
+                    input_messages.append(
+                        AgnoMessage(
+                            role="tool",
+                            content=msg.content,
+                            tool_call_id=msg.tool_call_id,
+                            tool_name=msg.tool_name,
+                        )
+                    )
+                    continue
+                if msg.role is CanonicalMessageRole.ASSISTANT and msg.tool_calls:
+                    tool_calls = []
+                    for tc in msg.tool_calls:
+                        if not (isinstance(tc.tool_call_id, str) and tc.tool_call_id.strip()):
+                            continue
+                        tool_calls.append(
+                            {
+                                "id": tc.tool_call_id,
+                                "type": "function",
+                                "function": {"name": tc.name, "arguments": json.dumps(tc.arguments, ensure_ascii=False)},
+                            }
+                        )
+                    input_messages.append(AgnoMessage(role="assistant", content=msg.content, tool_calls=tool_calls))
+                    continue
+                input_messages.append(AgnoMessage(role=msg.role.value, content=msg.content))
+
+        tools: list[AgnoFunction] = []
+        if self.tools_enabled and self.tool_registry is not None:
+            for spec in request.tools:
+                tools.append(
+                    AgnoFunction(
+                        name=spec.name,
+                        description=spec.description,
+                        parameters=spec.input_schema,
+                        external_execution=True,
+                    )
+                )
+        for fn in mcp_functions.values():
+            try:
+                setattr(fn, "external_execution", True)
+            except Exception:
+                pass
+            tools.append(fn)
+
+        agent = AgnoAgent(
+            name="Aura",
+            model=agno_model,
+            system_message=request.system or "",
+            db=None,
+            tools=tools,
+            stream=False,
+            stream_events=False,
+        )
+
+        metadata = {"aura_request_id": request_id, "aura_turn_id": turn_id}
+        out = await agent.arun(
+            input_messages,
+            stream=False,
+            session_id=self.session_id,
+            run_id=request_id,
+            metadata=metadata,
+            add_history_to_context=False,
+        )
+
+        assistant_text = ""
+        content = getattr(out, "content", None)
+        if isinstance(content, str):
+            assistant_text = content
+        elif content is not None:
+            assistant_text = str(content)
+
+        tool_calls: list[ToolCall] = []
+        for te in getattr(out, "tools", []) or []:
+            if not getattr(te, "external_execution_required", False):
+                continue
+            tcid = getattr(te, "tool_call_id", None)
+            name = getattr(te, "tool_name", None)
+            args = getattr(te, "tool_args", None)
+            if not isinstance(tcid, str) or not tcid or not isinstance(name, str) or not name:
+                continue
+            if not isinstance(args, dict):
+                args = {}
+            tool_calls.append(ToolCall(tool_call_id=tcid, name=name, arguments=dict(args), raw_arguments=None))
+
+        return assistant_text, tool_calls
+
+    def _build_request(self, *, extra_tools: list[ToolSpec] | None = None) -> CanonicalRequest:
+        tools: list[ToolSpec] = []
+        if self.tools_enabled and self.tool_registry is not None:
+            tools = [t for t in self.tool_registry.list_specs() if t.name != "project__apply_patch"]
+        if extra_tools:
+            tools = [*tools, *list(extra_tools)]
+        skills = self.skill_store.list()
+        plan = self.plan_store.get().plan
+
+        state = self.spec_state_store.get()
+        spec_summary = SpecStatusSummary(status=state.status, label=state.label)
+
+        surface = build_agent_surface(tools=tools, skills=skills, plan=plan, spec=spec_summary)
+
+        base_system = self.system_prompt or _load_default_system_prompt()
+        parts = [base_system]
+        if isinstance(self.memory_summary, str) and self.memory_summary.strip():
+            parts.append("Session memory summary:\n\n" + self.memory_summary.strip())
+        parts.append(surface)
+        system = "\n\n".join(parts)
+        return CanonicalRequest(system=system, messages=list(self._history or []), tools=tools)
+
+    async def _load_mcp_tooling(self, *, stack: AsyncExitStack) -> tuple[dict[str, Any], list[ToolSpec]]:
+        """
+        Build MCPTools instances from `.aura/config/mcp.json`, enter them, and return:
+        - mapping: tool_name -> agno Function (async)
+        - specs: ToolSpec list for agent surface
+        """
+        cfg = load_mcp_config(project_root=self.project_root)
+        if not cfg.servers:
+            return {}, []
+
+        functions: dict[str, Any] = {}
+        specs: list[ToolSpec] = []
+
+        try:
+            from agno.tools.mcp.mcp import MCPTools
+            from mcp import StdioServerParameters
+            from mcp.client.stdio import get_default_environment
+        except Exception:
+            return {}, []
+
+        def _prefix_for(server_name: str) -> str:
+            # Ensure stable + short-ish prefix, avoid exceeding provider tool name limits.
+            normalized = "".join(ch if (ch.isalnum() or ch in {"_", "-"}) else "_" for ch in server_name.strip())
+            normalized = normalized.strip("_") or "server"
+            digest = sha256(server_name.encode("utf-8", errors="ignore")).hexdigest()[:6]
+            base = normalized[:12]
+            return f"mcp__{base}_{digest}__"
+
+        for name, server in sorted(cfg.servers.items()):
+            if not server.enabled:
+                continue
+            if not server.command:
+                continue
+            env = {**get_default_environment(), **dict(server.env or {})}
+            server_params = StdioServerParameters(
+                command=server.command,
+                args=list(server.args),
+                env=env,
+                cwd=server.cwd,
+            )
+            toolkit = MCPTools(
+                server_params=server_params,
+                transport="stdio",
+                timeout_seconds=int(max(1, server.timeout_s)),
+                tool_name_prefix=_prefix_for(name),
+            )
+            entered = await stack.enter_async_context(toolkit)
+            try:
+                async_functions = entered.get_async_functions()
+            except Exception:
+                continue
+            for tool_name, fn in async_functions.items():
+                functions[tool_name] = fn
+                specs.append(
+                    ToolSpec(
+                        name=str(getattr(fn, "name", tool_name)),
+                        description=str(getattr(fn, "description", "") or ""),
+                        input_schema=dict(getattr(fn, "parameters", {}) or {"type": "object", "properties": {}}),
+                    )
+                )
+
+        return functions, specs
+
+    def _inspect_tool(self, *, planned: PlannedToolCall, mcp_functions: dict[str, Any]):
+        """
+        Aura tools use ToolRuntime.inspect(). MCP tools default to approval unless trusted.
+        """
+        if self.tool_runtime is None:
+            raise RuntimeError("Tool runtime not initialized.")
+        if self.tool_runtime.get_tool(planned.tool_name) is not None:
+            return self.tool_runtime.inspect(planned)
+        if planned.tool_name in mcp_functions:
+            from .tools.runtime import InspectionResult, ToolApprovalMode
+
+            mode = self.tool_runtime.get_approval_mode()
+            if mode is ToolApprovalMode.TRUSTED:
+                return InspectionResult(
+                    decision=InspectionDecision.ALLOW,
+                    action_summary=f"Execute MCP tool: {planned.tool_name}",
+                    risk_level="high",
+                    reason="Approval mode is trusted (auto-allow).",
+                    error_code=None,
+                    diff_ref=None,
+                )
+            diff_ref = self.tool_runtime.artifact_store.put(
+                json.dumps(planned.arguments, ensure_ascii=False, sort_keys=True, indent=2),
+                kind="diff",
+                meta={"summary": f"Preview for {planned.tool_name}"},
+            )
+            return InspectionResult(
+                decision=InspectionDecision.REQUIRE_APPROVAL,
+                action_summary=f"Execute MCP tool: {planned.tool_name}",
+                risk_level="high",
+                reason="MCP tools are treated as high-risk by default.",
+                error_code=None,
+                diff_ref=diff_ref,
+            )
+        return self.tool_runtime.inspect(planned)
+
+    async def _needs_more_approval(
+        self,
+        *,
+        request_id: str,
+        turn_id: str | None,
+        planned_calls: list[PlannedToolCall],
+        decision_map: dict[str, ToolDecision],
+        mcp_functions: dict[str, Any],
+        context_stats: dict[str, Any],
+        model_profile_id: str | None,
+    ) -> bool:
+        for planned in planned_calls:
+            inspection = self._inspect_tool(planned=planned, mcp_functions=mcp_functions)
+            if inspection.decision is InspectionDecision.REQUIRE_APPROVAL and planned.tool_call_id not in decision_map:
+                await self._pause_run(
+                    request_id=request_id,
+                    turn_id=turn_id,
+                    planned_calls=planned_calls,
+                    context_stats=context_stats,
+                    model_profile_id=model_profile_id,
+                )
+                return True
+        return False
+
+    async def _execute_planned_after_decisions(
+        self,
+        *,
+        planned: PlannedToolCall,
+        inspection: Any,
+        decision: ToolDecision | None,
+        request_id: str,
+        turn_id: str | None,
+        mcp_functions: dict[str, Any],
+    ) -> str:
+        if inspection.decision is InspectionDecision.DENY:
+            return await self._tool_result_denied(planned=planned, inspection=inspection, request_id=request_id, turn_id=turn_id)
+        if inspection.decision is InspectionDecision.REQUIRE_APPROVAL:
+            if decision is None or decision.decision != "approve":
+                return await self._tool_result_denied_by_user(planned=planned, request_id=request_id, turn_id=turn_id)
+        if self.tool_runtime is None:
+            raise RuntimeError("Tool runtime not initialized.")
+        if self.tool_runtime.get_tool(planned.tool_name) is not None:
+            return await self._execute_tool(planned=planned, request_id=request_id, turn_id=turn_id)
+        if planned.tool_name in mcp_functions:
+            return await self._execute_mcp_tool(
+                planned=planned,
+                fn=mcp_functions[planned.tool_name],
+                request_id=request_id,
+                turn_id=turn_id,
+            )
+        return await self._tool_result_error(
+            planned=planned,
+            request_id=request_id,
+            turn_id=turn_id,
+            error_code=ErrorCode.TOOL_UNKNOWN.value,
+            error_message=f"Unknown tool: {planned.tool_name}",
+        )
+
+    async def _execute_mcp_tool(self, *, planned: PlannedToolCall, fn: Any, request_id: str, turn_id: str | None) -> str:
+        await self._emit(
+            kind=EventKind.TOOL_CALL_START,
+            payload={
+                "tool_execution_id": planned.tool_execution_id,
+                "tool_name": planned.tool_name,
+                "tool_call_id": planned.tool_call_id,
+                "arguments_ref": planned.arguments_ref.to_dict(),
+                "tool_kind": "mcp",
+            },
+            request_id=request_id,
+            turn_id=turn_id,
+            step_id=planned.tool_execution_id,
+        )
+
+        started = time.monotonic()
+        try:
+            from agno.run import RunContext
+            from agno.tools.function import FunctionCall
+            from agno.tools.function import ToolResult as AgnoToolResult
+        except Exception as e:
+            return await self._tool_result_error(
+                planned=planned,
+                request_id=request_id,
+                turn_id=turn_id,
+                error_code=ErrorCode.UNKNOWN.value,
+                error_message=f"agno/mcp tooling unavailable: {e}",
+            )
+
+        try:
+            try:
+                fn._run_context = RunContext(run_id=request_id, session_id=self.session_id, metadata={"aura_request_id": request_id, "aura_turn_id": turn_id})
+            except Exception:
+                pass
+            fc = FunctionCall(function=fn, arguments=dict(planned.arguments), call_id=planned.tool_call_id)
+            res = await fc.aexecute()
+            if res.status != "success":
+                raise RuntimeError(res.error or "MCP tool execution failed")
+            raw = res.result
+            if isinstance(raw, AgnoToolResult):
+                raw_out: Any = {"content": raw.content}
+                if raw.images:
+                    raw_out["images"] = [img.to_dict() if hasattr(img, "to_dict") else img for img in raw.images]
+                raw = raw_out
+        except Exception as e:
+            duration_ms = int((time.monotonic() - started) * 1000)
+            code = _classify_tool_exception(e)
+            output_ref = self.artifact_store.put(
+                json.dumps({"ok": False, "tool": planned.tool_name, "error_code": code.value, "error": str(e)}, ensure_ascii=False, sort_keys=True, indent=2),
+                kind="tool_output",
+                meta={"summary": f"{planned.tool_name} output (error)"},
+            )
+            tool_message = json.dumps(
+                {"ok": False, "tool": planned.tool_name, "output_ref": output_ref.to_dict(), "error_code": code.value, "error": str(e), "result": None},
+                ensure_ascii=False,
+            )
+            tool_message_ref = self.artifact_store.put(tool_message, kind="tool_message", meta={"summary": f"{planned.tool_name} tool_result (error)"})
+            await self._emit(
+                kind=EventKind.TOOL_CALL_END,
+                payload={
+                    "tool_execution_id": planned.tool_execution_id,
+                    "tool_name": planned.tool_name,
+                    "tool_call_id": planned.tool_call_id,
+                    "status": "failed",
+                    "duration_ms": duration_ms,
+                    "output_ref": output_ref.to_dict(),
+                    "tool_message_ref": tool_message_ref.to_dict(),
+                    "error_code": code.value,
+                    "error": str(e),
+                    "tool_kind": "mcp",
+                },
+                request_id=request_id,
+                turn_id=turn_id,
+                step_id=planned.tool_execution_id,
+            )
+            return tool_message
+
+        duration_ms = int((time.monotonic() - started) * 1000)
+        output_ref = self.artifact_store.put(
+            json.dumps(raw, ensure_ascii=False, sort_keys=True, indent=2),
+            kind="tool_output",
+            meta={"summary": f"{planned.tool_name} output"},
+        )
+        tool_message = json.dumps({"ok": True, "tool": planned.tool_name, "output_ref": output_ref.to_dict(), "result": raw}, ensure_ascii=False)
+        tool_message_ref = self.artifact_store.put(tool_message, kind="tool_message", meta={"summary": f"{planned.tool_name} tool_result"})
+        await self._emit(
+            kind=EventKind.TOOL_CALL_END,
+            payload={
+                "tool_execution_id": planned.tool_execution_id,
+                "tool_name": planned.tool_name,
+                "tool_call_id": planned.tool_call_id,
+                "status": "succeeded",
+                "duration_ms": duration_ms,
+                "output_ref": output_ref.to_dict(),
+                "tool_message_ref": tool_message_ref.to_dict(),
+                "error_code": None,
+                "error": None,
+                "tool_kind": "mcp",
+            },
+            request_id=request_id,
+            turn_id=turn_id,
+            step_id=planned.tool_execution_id,
+        )
+        return tool_message
+
+    def _write_context_ref(self, request: CanonicalRequest) -> ArtifactRef:
+        payload = _canonical_request_to_redacted_dict(request)
+        return self.artifact_store.put(
+            json.dumps(payload, ensure_ascii=False),
+            kind="llm_context",
+            meta={"summary": "CanonicalRequest (redacted)"},
+        )
+
+    async def _emit_llm_response_completed(
+        self,
+        *,
+        final_response: LLMResponse,
+        planned_calls: list[PlannedToolCall],
+        context_stats: dict[str, Any] | None,
+        request_id: str,
+        turn_id: str | None,
+        step_id: str,
+        extra_payload: dict[str, Any] | None = None,
+    ) -> None:
+        usage = final_response.usage.__dict__ if final_response.usage is not None else None
+        merged_stats: dict[str, Any] = dict(context_stats or {})
+        used_tokens = None
+        if isinstance(usage, dict) and isinstance(usage.get("input_tokens"), int):
+            used_tokens = int(usage["input_tokens"])
+            merged_stats["input_tokens"] = used_tokens
+            merged_stats["usage_source"] = "provider"
+        elif isinstance(merged_stats.get("estimated_input_tokens"), int):
+            used_tokens = int(merged_stats["estimated_input_tokens"])
+            merged_stats["usage_source"] = "estimate"
+        if isinstance(merged_stats.get("context_limit_tokens"), int) and isinstance(used_tokens, int):
+            merged_stats["context_left_percent"] = compute_context_left_percent(
+                used_tokens=used_tokens,
+                context_limit_tokens=int(merged_stats["context_limit_tokens"]),
+            )
+
+        assistant_text = final_response.text
+        output_ref = self.artifact_store.put(
+            assistant_text,
+            kind="chat_assistant",
+            meta={"summary": _summarize_text(assistant_text)},
+        )
+        payload: dict[str, Any] = {
+            "profile_id": final_response.profile_id,
+            "provider_kind": final_response.provider_kind.value,
+            "model": final_response.model,
+            "output_ref": output_ref.to_dict(),
+            "tool_calls": [
+                {
+                    "tool_execution_id": p.tool_execution_id,
+                    "tool_name": p.tool_name,
+                    "tool_call_id": p.tool_call_id,
+                    "arguments_ref": p.arguments_ref.to_dict(),
+                }
+                for p in planned_calls
+            ],
+            "usage": usage,
+            "context_stats": merged_stats,
+            "stop_reason": final_response.stop_reason,
+        }
+        if isinstance(extra_payload, dict):
+            payload.update(extra_payload)
+
+        await self._emit(
+            kind=EventKind.LLM_RESPONSE_COMPLETED,
+            payload=payload,
+            request_id=request_id,
+            turn_id=turn_id,
+            step_id=step_id,
+        )
+
+        if isinstance(usage, dict):
+            try:
+                self.session_store.update_session(self.session_id, {"last_usage": usage, "last_context_stats": merged_stats})
+            except Exception:
+                pass
+
+    async def _pause_run(
+        self,
+        *,
+        request_id: str,
+        turn_id: str | None,
+        planned_calls: list[PlannedToolCall],
+        context_stats: dict[str, Any],
+        model_profile_id: str | None,
+    ) -> str:
+        approval_id = new_id("appr")
+        record = ApprovalRecord(
+            approval_id=approval_id,
+            session_id=self.session_id,
+            request_id=request_id,
+            created_at=now_ts_ms(),
+            status=ApprovalStatus.PENDING,
+            turn_id=turn_id,
+            action_summary=f"Approve to execute {len(planned_calls)} tool call(s).",
+            risk_level="high",
+            options=["approve", "deny"],
+            reason="Tool calls require approval.",
+            diff_ref=None,
+            resume_kind="run_continue",
+            resume_payload={
+                "tool_calls": [
+                    {"tool_name": p.tool_name, "tool_call_id": p.tool_call_id, "arguments_ref": p.arguments_ref.to_dict()}
+                    for p in planned_calls
+                ]
+            },
+        )
+        self.approval_store.create(record)
+        await self._emit(
+            kind=EventKind.APPROVAL_REQUIRED,
+            payload={
+                "approval_id": approval_id,
+                "action_summary": record.action_summary,
+                "risk_level": record.risk_level,
+                "options": record.options,
+                "reason": record.reason,
+                "diff_ref": record.diff_ref,
+            },
+            request_id=request_id,
+            turn_id=turn_id,
+            step_id=None,
+        )
+
+        snapshot = RunSnapshot(
+            schema_version="0.2",
+            run_id=request_id,
+            session_id=self.session_id,
+            model_profile_id=model_profile_id,
+            created_at=now_ts_ms(),
+            turn_id=turn_id,
+            approval_id=approval_id,
+            messages=list(self._history or []),
+            pending_tools=[SnapshotPendingToolCall(tool_call_id=p.tool_call_id, tool_name=p.tool_name, args=dict(p.arguments)) for p in planned_calls],
+        )
+        write_run_snapshot(project_root=self.project_root, snapshot=snapshot)
+        await self._emit(
+            kind=EventKind.RUN_PAUSED,
+            payload={
+                "run_id": request_id,
+                "approval_id": approval_id,
+                "pending_tools": [t.to_dict() for t in snapshot.pending_tools],
+                "context_stats": dict(context_stats),
+            },
+            request_id=request_id,
+            turn_id=turn_id,
+            step_id=None,
+        )
+        return approval_id
+
+    async def _execute_tool(self, *, planned: PlannedToolCall, request_id: str, turn_id: str | None) -> str:
+        tool = self.tool_runtime.get_tool(planned.tool_name) if self.tool_runtime is not None else None
+        if tool is None:
+            inspection = self.tool_runtime.inspect(planned) if self.tool_runtime is not None else None
+            error_code = inspection.error_code.value if inspection and inspection.error_code is not None else ErrorCode.TOOL_UNKNOWN.value
+            error_message = f"Unknown tool: {planned.tool_name}"
+            return await self._tool_result_error(
+                planned=planned,
+                request_id=request_id,
+                turn_id=turn_id,
+                error_code=error_code,
+                error_message=error_message,
+            )
+
+        await self._emit(
+            kind=EventKind.TOOL_CALL_START,
+            payload={
+                "tool_execution_id": planned.tool_execution_id,
+                "tool_name": planned.tool_name,
+                "tool_call_id": planned.tool_call_id,
+                "arguments_ref": planned.arguments_ref.to_dict(),
+            },
+            request_id=request_id,
+            turn_id=turn_id,
+            step_id=planned.tool_execution_id,
+        )
+
+        ctx = ToolExecutionContext(
+            session_id=self.session_id,
+            request_id=request_id,
+            turn_id=turn_id,
+            tool_execution_id=planned.tool_execution_id,
+            event_bus=self.event_bus,
+        )
+
+        started = time.monotonic()
+        try:
+            try:
+                from inspect import Parameter, signature
+
+                params = signature(tool.execute).parameters
+                accepts_context = "context" in params or any(p.kind is Parameter.VAR_KEYWORD for p in params.values())
+            except Exception:
+                accepts_context = False
+
+            if accepts_context:
+                raw = await asyncio.to_thread(tool.execute, args=planned.arguments, project_root=self.project_root, context=ctx)
+            else:
+                raw = await asyncio.to_thread(tool.execute, args=planned.arguments, project_root=self.project_root)
+        except Exception as e:
+            duration_ms = int((time.monotonic() - started) * 1000)
+            code = _classify_tool_exception(e)
+            output_ref = self.artifact_store.put(
+                json.dumps({"ok": False, "tool": planned.tool_name, "error_code": code.value, "error": str(e)}, ensure_ascii=False, sort_keys=True, indent=2),
+                kind="tool_output",
+                meta={"summary": f"{planned.tool_name} output (error)"},
+            )
+            tool_message = json.dumps(
+                {"ok": False, "tool": planned.tool_name, "output_ref": output_ref.to_dict(), "error_code": code.value, "error": str(e), "result": None},
+                ensure_ascii=False,
+            )
+            tool_message_ref = self.artifact_store.put(tool_message, kind="tool_message", meta={"summary": f"{planned.tool_name} tool_result (error)"})
+            await self._emit(
+                kind=EventKind.TOOL_CALL_END,
+                payload={
+                    "tool_execution_id": planned.tool_execution_id,
+                    "tool_name": planned.tool_name,
+                    "tool_call_id": planned.tool_call_id,
+                    "status": "failed",
+                    "duration_ms": duration_ms,
+                    "output_ref": output_ref.to_dict(),
+                    "tool_message_ref": tool_message_ref.to_dict(),
+                    "error_code": code.value,
+                    "error": str(e),
+                },
+                request_id=request_id,
+                turn_id=turn_id,
+                step_id=planned.tool_execution_id,
+            )
+            return tool_message
+
+        duration_ms = int((time.monotonic() - started) * 1000)
+        output_ref = self.artifact_store.put(
+            json.dumps(raw, ensure_ascii=False, sort_keys=True, indent=2),
+            kind="tool_output",
+            meta={"summary": f"{planned.tool_name} output"},
+        )
+        tool_message = json.dumps({"ok": True, "tool": planned.tool_name, "output_ref": output_ref.to_dict(), "result": raw}, ensure_ascii=False)
+        tool_message_ref = self.artifact_store.put(tool_message, kind="tool_message", meta={"summary": f"{planned.tool_name} tool_result"})
+        await self._emit(
+            kind=EventKind.TOOL_CALL_END,
+            payload={
+                "tool_execution_id": planned.tool_execution_id,
+                "tool_name": planned.tool_name,
+                "tool_call_id": planned.tool_call_id,
+                "status": "succeeded",
+                "duration_ms": duration_ms,
+                "output_ref": output_ref.to_dict(),
+                "tool_message_ref": tool_message_ref.to_dict(),
+                "error_code": None,
+                "error": None,
+            },
+            request_id=request_id,
+            turn_id=turn_id,
+            step_id=planned.tool_execution_id,
+        )
+        return tool_message
+
+    async def _tool_result_denied(
+        self,
+        *,
+        planned: PlannedToolCall,
+        inspection: Any,
+        request_id: str,
+        turn_id: str | None,
+    ) -> str:
+        error_code = inspection.error_code.value if getattr(inspection, "error_code", None) is not None else ErrorCode.PERMISSION.value
+        error_message = getattr(inspection, "reason", None) or getattr(inspection, "action_summary", None) or "Tool call denied."
+        return await self._tool_result_error(
+            planned=planned,
+            request_id=request_id,
+            turn_id=turn_id,
+            error_code=error_code,
+            error_message=str(error_message),
+            status="denied",
+        )
+
+    async def _tool_result_denied_by_user(self, *, planned: PlannedToolCall, request_id: str, turn_id: str | None) -> str:
+        return await self._tool_result_error(
+            planned=planned,
+            request_id=request_id,
+            turn_id=turn_id,
+            error_code=ErrorCode.CANCELLED.value,
+            error_message="Approval denied.",
+            status="cancelled",
+        )
+
+    async def _tool_result_error(
+        self,
+        *,
+        planned: PlannedToolCall,
+        request_id: str,
+        turn_id: str | None,
+        error_code: str,
+        error_message: str,
+        status: str = "failed",
+    ) -> str:
+        output_ref = self.artifact_store.put(
+            json.dumps({"ok": False, "tool": planned.tool_name, "error_code": error_code, "error": error_message}, ensure_ascii=False, sort_keys=True, indent=2),
+            kind="tool_output",
+            meta={"summary": f"{planned.tool_name} output ({status})"},
+        )
+        tool_message = json.dumps(
+            {"ok": False, "tool": planned.tool_name, "output_ref": output_ref.to_dict(), "error_code": error_code, "error": error_message, "result": None},
+            ensure_ascii=False,
+        )
+        tool_message_ref = self.artifact_store.put(tool_message, kind="tool_message", meta={"summary": f"{planned.tool_name} tool_result ({status})"})
+        await self._emit(
+            kind=EventKind.TOOL_CALL_END,
+            payload={
+                "tool_execution_id": planned.tool_execution_id,
+                "tool_name": planned.tool_name,
+                "tool_call_id": planned.tool_call_id,
+                "status": status,
+                "duration_ms": 0,
+                "output_ref": output_ref.to_dict(),
+                "tool_message_ref": tool_message_ref.to_dict(),
+                "error_code": error_code,
+                "error": error_message,
+            },
+            request_id=request_id,
+            turn_id=turn_id,
+            step_id=planned.tool_execution_id,
+        )
+        return tool_message
+
+    async def _emit(
+        self,
+        *,
+        kind: EventKind,
+        payload: dict[str, Any],
+        request_id: str | None,
+        turn_id: str | None,
+        step_id: str | None,
+    ) -> Event:
+        async with self._event_lock:
+            self._event_sequence += 1
+            event = Event(
+                kind=kind.value,
+                payload=payload,
+                session_id=self.session_id,
+                event_id=new_id("evt"),
+                timestamp=now_ts_ms(),
+                sequence=self._event_sequence,
+                request_id=request_id,
+                turn_id=turn_id,
+                step_id=step_id,
+                schema_version=self.schema_version,
+            )
+            self.event_bus.publish(event)
+            try:
+                self.session_store.update_session(
+                    self.session_id,
+                    {"last_request_id": request_id, "last_event_id": event.event_id, "last_event_sequence": self._event_sequence},
+                )
+            except Exception:
+                pass
+            return event
+
+    def _build_agno_model(self, profile: Any) -> Any:
+        provider_kind = getattr(profile, "provider_kind", None)
+        model_name = getattr(profile, "model_name", None)
+        base_url = getattr(profile, "base_url", None)
+        timeout_s = getattr(profile, "timeout_s", None)
+        if model_name is None or not isinstance(model_name, str) or not model_name.strip():
+            raise ValueError("Selected model profile is missing model_name.")
+
+        kind_value = getattr(provider_kind, "value", provider_kind)
+
+        if kind_value == "openai_compatible":
+            from agno.models.openai.like import OpenAILike
+
+            api_key = _resolve_api_key(profile)
+            kwargs: dict[str, Any] = {"id": model_name.strip(), "api_key": api_key}
+            if isinstance(base_url, str) and base_url.strip():
+                kwargs["base_url"] = base_url.strip()
+            if isinstance(timeout_s, (int, float)) and not isinstance(timeout_s, bool) and float(timeout_s) > 0:
+                kwargs["timeout"] = float(timeout_s)
+            return OpenAILike(**kwargs)
+
+        if kind_value == "anthropic":
+            from agno.models.anthropic.claude import Claude
+
+            api_key = _resolve_api_key(profile)
+            kwargs = {"id": model_name.strip(), "api_key": api_key}
+            if isinstance(timeout_s, (int, float)) and not isinstance(timeout_s, bool) and float(timeout_s) > 0:
+                kwargs["timeout"] = float(timeout_s)
+            return Claude(**kwargs)
+
+        raise RuntimeError(f"Unsupported provider_kind for agno engine: {kind_value!r}")
