@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from .anthropic import AnthropicAdapter
-from .gemini_internal import GeminiInternalAdapter
+from .gemini import GeminiAdapter
 from .openai_compatible import OpenAICompatibleAdapter
 
-__all__ = ["AnthropicAdapter", "GeminiInternalAdapter", "OpenAICompatibleAdapter"]
+__all__ = ["AnthropicAdapter", "GeminiAdapter", "OpenAICompatibleAdapter"]

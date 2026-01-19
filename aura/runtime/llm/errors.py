@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import threading
 from enum import StrEnum
 from typing import Any
@@ -151,6 +152,11 @@ def wrap_provider_exception(
     request_id = getattr(exc, "request_id", None)
     retryable = is_retryable_error_code(code)
     message = str(exc) or exc.__class__.__name__
+    extra = _provider_error_detail(exc)
+    if extra:
+        # Avoid repeating identical strings.
+        if extra not in message:
+            message = f"{message}: {extra}"
     details = {"operation": operation}
     return LLMRequestError(
         message,
@@ -164,3 +170,64 @@ def wrap_provider_exception(
         details=details,
         cause=exc,
     )
+
+
+def _provider_error_detail(exc: BaseException) -> str | None:
+    # OpenAI SDK HTTP errors often include a structured body with the real error message.
+    if isinstance(exc, openai.OpenAIError):
+        body = getattr(exc, "body", None)
+        if isinstance(body, dict):
+            err = body.get("error")
+            if isinstance(err, dict):
+                msg = err.get("message")
+                typ = err.get("type")
+                param = err.get("param")
+                code = err.get("code")
+                parts: list[str] = []
+                if isinstance(msg, str) and msg.strip():
+                    parts.append(msg.strip())
+                meta: list[str] = []
+                if isinstance(typ, str) and typ.strip():
+                    meta.append(f"type={typ.strip()}")
+                if isinstance(param, str) and param.strip():
+                    meta.append(f"param={param.strip()}")
+                if isinstance(code, str) and code.strip():
+                    meta.append(f"code={code.strip()}")
+                if meta:
+                    parts.append("(" + ", ".join(meta) + ")")
+                if parts:
+                    return " ".join(parts).strip()
+            # Fall back to a compact JSON dump.
+            return _truncate(_safe_json_dumps(body), 2000)
+        if isinstance(body, str) and body.strip():
+            return _truncate(body.strip(), 2000)
+        return None
+
+    # Anthropic SDK errors may also carry response information; keep best-effort.
+    if isinstance(exc, anthropic.AnthropicError):
+        body = getattr(exc, "body", None)
+        if isinstance(body, dict):
+            msg = body.get("message")
+            if isinstance(msg, str) and msg.strip():
+                return msg.strip()
+            return _truncate(_safe_json_dumps(body), 2000)
+        if isinstance(body, str) and body.strip():
+            return _truncate(body.strip(), 2000)
+        return None
+
+    return None
+
+
+def _safe_json_dumps(obj: Any) -> str:
+    try:
+        return json.dumps(obj, ensure_ascii=False, sort_keys=True)
+    except Exception:
+        return repr(obj)
+
+
+def _truncate(text: str, max_chars: int) -> str:
+    if max_chars <= 0 or not text:
+        return ""
+    if len(text) <= max_chars:
+        return text
+    return text[: max(0, max_chars - 1)] + "…"

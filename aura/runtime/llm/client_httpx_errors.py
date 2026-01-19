@@ -23,6 +23,13 @@ def _wrap_httpx_like_exception(
             status_code = None
         elif isinstance(exc, httpx.HTTPStatusError):
             status_code = int(exc.response.status_code)
+            body_snippet: str | None = None
+            try:
+                text = exc.response.text
+                if isinstance(text, str) and text.strip():
+                    body_snippet = text.strip()[:2000]
+            except Exception:
+                body_snippet = None
             code = LLMErrorCode.UNKNOWN
             if status_code == 400:
                 code = LLMErrorCode.BAD_REQUEST
@@ -53,8 +60,14 @@ def _wrap_httpx_like_exception(
         LLMErrorCode.SERVER_ERROR,
         LLMErrorCode.NETWORK_ERROR,
     }
+    message = str(exc) or exc.__class__.__name__
+    try:
+        if "body_snippet" in locals() and isinstance(body_snippet, str) and body_snippet:
+            message = f"{message}\n\nProvider response (truncated):\n{body_snippet}"
+    except Exception:
+        pass
     return LLMRequestError(
-        str(exc) or exc.__class__.__name__,
+        message,
         code=code,
         provider_kind=provider_kind,
         profile_id=profile_id,
@@ -65,4 +78,3 @@ def _wrap_httpx_like_exception(
         details={"operation": operation},
         cause=exc,
     )
-

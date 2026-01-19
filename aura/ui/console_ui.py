@@ -273,7 +273,7 @@ class ConsoleUI:
 
         if k is UIEventKind.SESSION_STARTED:
             self._println_dim(f"Session: {p.get('session_id','')}".strip())
-            self._println_dim("Commands: /help /clear /perm /model /exit. Ctrl+C cancels.")
+            self._println_dim("Commands: /help /clear /perm /model /stream /compact /exit. Ctrl+C cancels.")
             return
 
         if k is UIEventKind.PROMPT_READY:

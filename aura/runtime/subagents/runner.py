@@ -248,13 +248,13 @@ def run_subagent(
         resolved = model_router.resolve(role=ModelRole.MAIN, requirements=requirements)
         selected_profile_id = getattr(resolved.profile, "profile_id", None)
 
-    # Build agno model.
+    # Build agno model (Aura-backed).
     try:
-        from ..llm.client_agno import _build_agno_model
+        from ..llm.agno_aura_model import build_aura_agno_model
     except Exception as e:  # pragma: no cover - optional dependency
         raise RuntimeError(f"agno model adapter unavailable: {e}") from e
 
-    agno_model = _build_agno_model(resolved.profile)
+    agno_model = build_aura_agno_model(profile=resolved.profile, project_root=project_root, session_id=session_id)
 
     # Build toolset for the delegated run.
     all_specs = tool_registry.list_specs() if hasattr(tool_registry, "list_specs") else []
@@ -526,4 +526,3 @@ def run_subagent(
         "report": report,
         "transcript_ref": transcript_ref.to_dict(),
     }
-

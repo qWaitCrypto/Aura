@@ -419,6 +419,7 @@ def _cmd_chat(args: argparse.Namespace) -> int:
                     "project_ref": str(paths.project_root),
                     "mode": "chat",
                     "tool_approval_mode": default_approval_mode.value,
+                    "llm_streaming": True,
                 }
             )
             session_meta = session_store.get_session(session_id)
@@ -488,6 +489,15 @@ def _cmd_chat(args: argparse.Namespace) -> int:
         orchestrator.memory_summary = memory_summary
     if orchestrator.tool_runtime is not None:
         orchestrator.tool_runtime.set_approval_mode(approval_mode)
+    raw_streaming = session_meta.get("llm_streaming")
+    if isinstance(raw_streaming, bool):
+        orchestrator.set_llm_streaming(raw_streaming)
+    else:
+        orchestrator.set_llm_streaming(True)
+        try:
+            session_store.update_session(session_id, {"llm_streaming": True})
+        except Exception:
+            pass
     orchestrator.load_history_from_events()
     orchestrator.apply_memory_summary_retention()
 
@@ -579,7 +589,7 @@ def _run_chat_console_ui(
             from prompt_toolkit.keys import Keys
 
             class _SlashCompleter(Completer):
-                _cmds = ["/help", "/clear", "/perm", "/model", "/compact", "/exit", "/quit"]
+                _cmds = ["/help", "/clear", "/perm", "/model", "/stream", "/compact", "/exit", "/quit"]
 
                 def get_completions(self, document, complete_event):
                     text = document.text_before_cursor
@@ -668,6 +678,7 @@ def _run_chat_console_ui(
         except Exception:
             yield
             return
+
         try:
             import termios  # type: ignore
 
@@ -676,16 +687,19 @@ def _run_chat_console_ui(
             new = list(old)
             new[3] = new[3] & ~termios.ECHO
             termios.tcsetattr(fd, termios.TCSADRAIN, new)
-            try:
-                yield
-            finally:
-                try:
-                    termios.tcsetattr(fd, termios.TCSADRAIN, old)
-                    termios.tcflush(fd, termios.TCIFLUSH)
-                except Exception:
-                    pass
         except Exception:
+            # If we can't control ECHO, fall back to normal input behavior.
             yield
+            return
+
+        try:
+            yield
+        finally:
+            try:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old)
+                termios.tcflush(fd, termios.TCIFLUSH)
+            except Exception:
+                pass
 
     def _run_op(op: Op) -> None:
         cancel = CancellationToken()
@@ -1056,7 +1070,7 @@ def _run_chat_console_ui(
                     UIEventKind.LOG,
                     {
                         "level": "help",
-                        "message": "Enter=send; Ctrl+J=newline; Ctrl+C=cancel; /clear clears; /perm sets tool approval mode; /model selects chat model; /compact summarizes and prunes history; /exit quits.",
+                        "message": "Enter=send; Ctrl+J=newline; Ctrl+C=cancel; /clear clears; /perm sets tool approval mode; /model selects chat model; /stream toggles LLM streaming; /compact summarizes and prunes history; /exit quits.",
                     },
                 )
             )
@@ -1074,6 +1088,42 @@ def _run_chat_console_ui(
                 turn_id=new_id("turn"),
             )
             _run_op(op)
+            continue
+        if cmd.startswith("/stream"):
+            parts = cmd.split()
+            if len(parts) == 1:
+                state = "on" if orchestrator.get_llm_streaming() else "off"
+                ui.emit(
+                    UIEvent(
+                        UIEventKind.LOG,
+                        {
+                            "level": "policy",
+                            "message": f"LLM streaming: {state}\nUsage: /stream [on|off|toggle]",
+                        },
+                    )
+                )
+                continue
+            raw = parts[1].strip().lower()
+            if raw in {"toggle", "t"}:
+                enabled = not orchestrator.get_llm_streaming()
+            elif raw in {"on", "true", "1", "yes", "y"}:
+                enabled = True
+            elif raw in {"off", "false", "0", "no", "n"}:
+                enabled = False
+            else:
+                ui.emit(UIEvent(UIEventKind.WARNING, {"message": "Usage: /stream [on|off|toggle]"}))
+                continue
+            orchestrator.set_llm_streaming(enabled)
+            try:
+                orchestrator.session_store.update_session(orchestrator.session_id, {"llm_streaming": enabled})
+            except Exception:
+                pass
+            ui.emit(
+                UIEvent(
+                    UIEventKind.LOG,
+                    {"level": "policy", "message": f"LLM streaming set to: {'on' if enabled else 'off'}"},
+                )
+            )
             continue
         if cmd.startswith("/model"):
             parts = cmd.split()
@@ -1807,10 +1857,10 @@ def _cmd_init(args: argparse.Namespace) -> int:
                     "      },",
                     '      "capabilities": { "supports_tools": true, "supports_streaming": true }',
                     "    },",
-                    '    "gemini_internal": {',
-                    '      "provider_kind": "gemini_internal",',
-                    '      "base_url": "",',
-                    '      "model": "gemini-3-flash",',
+                    '    "gemini": {',
+                    '      "provider_kind": "gemini",',
+                    '      "base_url": "https://maas-openapi.wanjiedata.com/api",',
+                    '      "model": "gemini-2.5-flash-lite",',
                     '      "api_key": "replace-me",',
                     '      "timeout_s": 60,',
                     '      "limits": { "context_limit_tokens": null, "max_output_tokens": null },',
@@ -1820,12 +1870,10 @@ def _cmd_init(args: argparse.Namespace) -> int:
                     '        "history_budget_fallback_tokens": 8000,',
                     '        "tool_output_budget_tokens": 400',
                     "      },",
-                    '      "capabilities": { "supports_tools": true, "supports_streaming": false },',
+                    '      "capabilities": { "supports_tools": true, "supports_streaming": true },',
                     '      "default_params": {',
-                    '        "project": "",',
-                    '        "session_id": "",',
                     '        "generationConfig": {',
-                    '          "thinkingConfig": { "includeThoughts": false }',
+                    '          "thinkingConfig": { "includeThoughts": true, "thinkingBudget": 8192 }',
                     "        }",
                     "      }",
                     "    }",

@@ -22,25 +22,35 @@ def _gemini_usage_from_metadata(meta: Any) -> LLMUsage | None:
     )
 
 
-def _gemini_internal_to_response(*, profile_id: str, data: Any) -> LLMResponse:
-    if not isinstance(data, dict):
-        raise ProviderAdapterError("gemini_internal response must be a JSON object.")
+def _normalize_candidates(root: dict[str, Any]) -> list[dict[str, Any]]:
+    candidates = root.get("candidates")
+    if isinstance(candidates, list):
+        out: list[dict[str, Any]] = []
+        for item in candidates:
+            if isinstance(item, dict):
+                out.append(item)
+        return out
+    if isinstance(candidates, dict):
+        return [candidates]
+    return []
 
+
+def gemini_to_response(*, profile_id: str, data: Any) -> LLMResponse:
+    if not isinstance(data, dict):
+        raise ProviderAdapterError("gemini response must be a JSON object.")
+
+    # Some gateways wrap the payload.
     root = data.get("response") if isinstance(data.get("response"), dict) else data
     if not isinstance(root, dict):
-        raise ProviderAdapterError("gemini_internal response wrapper is invalid.")
+        raise ProviderAdapterError("gemini response wrapper is invalid.")
 
-    candidates = root.get("candidates")
-    if not isinstance(candidates, list) or not candidates:
-        raise ProviderAdapterError("gemini_internal response is missing candidates[0].")
+    candidates = _normalize_candidates(root)
+    if not candidates:
+        raise ProviderAdapterError("gemini response is missing candidates[0].")
     cand0 = candidates[0]
-    if not isinstance(cand0, dict):
-        raise ProviderAdapterError("gemini_internal candidates[0] must be an object.")
 
     content = cand0.get("content")
-    parts = None
-    if isinstance(content, dict):
-        parts = content.get("parts")
+    parts = content.get("parts") if isinstance(content, dict) else None
     if not isinstance(parts, list):
         parts = []
 
@@ -49,21 +59,27 @@ def _gemini_internal_to_response(*, profile_id: str, data: Any) -> LLMResponse:
     for idx, part in enumerate(parts):
         if not isinstance(part, dict):
             continue
-        if "text" in part and isinstance(part.get("text"), str) and part.get("thought") is not True:
-            text_parts.append(part["text"])
+        text = part.get("text")
+        if isinstance(text, str) and part.get("thought") is not True:
+            text_parts.append(text)
         fc = part.get("functionCall")
         if isinstance(fc, dict):
             name = fc.get("name")
             args = fc.get("args")
-            thought_sig = part.get("thoughtSignature") or part.get("thought_signature")
+            thought_sig = (
+                part.get("thoughtSignature")
+                or part.get("thought_signature")
+                or fc.get("thoughtSignature")
+                or fc.get("thought_signature")
+            )
             if not isinstance(name, str) or not name:
-                raise ProviderAdapterError("gemini_internal functionCall missing name.")
+                raise ProviderAdapterError("gemini functionCall missing name.")
             if args is None:
                 parsed_args: dict[str, Any] = {}
             elif isinstance(args, dict):
                 parsed_args = args
             else:
-                raise ProviderAdapterError("gemini_internal functionCall.args must be an object.")
+                raise ProviderAdapterError("gemini functionCall.args must be an object.")
             raw = json.dumps(parsed_args, ensure_ascii=False)
             tool_calls.append(
                 ToolCall(
@@ -76,21 +92,23 @@ def _gemini_internal_to_response(*, profile_id: str, data: Any) -> LLMResponse:
             )
 
     model = root.get("modelVersion")
-    model_str = model if isinstance(model, str) else ""
+    if not isinstance(model, str) or not model:
+        model = root.get("model") if isinstance(root.get("model"), str) else ""
+
     stop = cand0.get("finishReason")
     stop_str = stop if isinstance(stop, str) else None
+
     request_id = root.get("responseId")
     request_id_str = request_id if isinstance(request_id, str) else None
 
     usage = _gemini_usage_from_metadata(root.get("usageMetadata"))
     return LLMResponse(
-        provider_kind=ProviderKind.GEMINI_INTERNAL,
+        provider_kind=ProviderKind.GEMINI,
         profile_id=profile_id,
-        model=model_str,
+        model=model or "",
         text="".join(text_parts),
         tool_calls=tool_calls,
         usage=usage,
         stop_reason=stop_str,
         request_id=request_id_str,
     )
-

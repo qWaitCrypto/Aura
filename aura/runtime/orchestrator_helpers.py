@@ -227,6 +227,7 @@ def _tool_calls_from_payload(raw: Any, *, read_artifact_text) -> list[ToolCall]:
         tool_call_id = item.get("tool_call_id")
         name = item.get("tool_name") or item.get("name")
         args_ref_raw = item.get("arguments_ref")
+        thought_signature = item.get("thought_signature") or item.get("thoughtSignature")
         if not isinstance(tool_call_id, str) or not tool_call_id:
             continue
         if not isinstance(name, str) or not name:
@@ -240,7 +241,8 @@ def _tool_calls_from_payload(raw: Any, *, read_artifact_text) -> list[ToolCall]:
             continue
         if not isinstance(args_any, dict):
             continue
-        out.append(ToolCall(tool_call_id=tool_call_id, name=name, arguments=args_any, raw_arguments=None))
+        sig = thought_signature.strip() if isinstance(thought_signature, str) and thought_signature.strip() else None
+        out.append(ToolCall(tool_call_id=tool_call_id, name=name, arguments=args_any, raw_arguments=None, thought_signature=sig))
     return out
 
 

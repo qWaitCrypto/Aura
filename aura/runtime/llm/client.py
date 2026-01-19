@@ -9,7 +9,7 @@ from typing import Iterator
 
 from .client_common import _merge_requirements, _raise_if_cancelled
 from .client_exec_anthropic import complete_anthropic, stream_anthropic
-from .client_exec_gemini_internal import complete_gemini_internal
+from .client_exec_gemini import complete_gemini, stream_gemini
 from .client_exec_openai_compatible import complete_openai_compatible, stream_openai_compatible
 from .config import ModelConfig
 from .errors import CancellationToken, LLMErrorCode, LLMRequestError, ProviderAdapterError
@@ -71,8 +71,8 @@ class LLMClient:
                 trace=trace,
             )
 
-        if profile.provider_kind is ProviderKind.GEMINI_INTERNAL:
-            return complete_gemini_internal(
+        if profile.provider_kind is ProviderKind.GEMINI:
+            return complete_gemini(
                 profile=profile,
                 request=request,
                 timeout_s=timeout_s,
@@ -125,8 +125,15 @@ class LLMClient:
             )
             return
 
-        if profile.provider_kind is ProviderKind.GEMINI_INTERNAL:
-            raise ProviderAdapterError("gemini_internal does not support streaming; use complete().")
+        if profile.provider_kind is ProviderKind.GEMINI:
+            yield from stream_gemini(
+                profile=profile,
+                request=request,
+                timeout_s=timeout_s,
+                cancel=cancel,
+                trace=trace,
+            )
+            return
 
         if profile.provider_kind is ProviderKind.ANTHROPIC:
             yield from stream_anthropic(
