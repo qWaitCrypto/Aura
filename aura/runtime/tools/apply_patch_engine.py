@@ -139,6 +139,20 @@ def _parse_one_hunk(lines: list[str], line_number: int) -> tuple[PatchOp, int]:
         raise PatchParseError("invalid hunk: empty")
     first_line = lines[0].strip()
 
+    # Common misformat: unified diff headers inside an apply_patch envelope.
+    if first_line.startswith("--- ") and len(lines) >= 2 and lines[1].strip().startswith("+++ "):
+        raise PatchParseError(
+            "This looks like a unified diff hunk header ('---'/'+++'). "
+            "project__apply_patch expects Codex apply_patch format.\n\n"
+            "Use this structure:\n"
+            "*** Begin Patch\n"
+            "*** Update File: <relative/path>\n"
+            "@@\n"
+            "-<old line>\n"
+            "+<new line>\n"
+            "*** End Patch"
+        )
+
     if first_line.startswith(ADD_FILE_MARKER):
         path = first_line[len(ADD_FILE_MARKER) :]
         contents = ""
@@ -202,7 +216,18 @@ def _parse_update_file_chunk(
         change_context: str | None = None
         start_index = 1
     elif lines[0].startswith(CHANGE_CONTEXT_MARKER):
-        change_context = lines[0][len(CHANGE_CONTEXT_MARKER) :]
+        # Many models mistakenly emit unified diff range headers (e.g. "@@ -10,6 +11,7 @@").
+        # Treat these as "no explicit context" and rely on the +/- old_lines matcher instead.
+        change_context_raw = lines[0][len(CHANGE_CONTEXT_MARKER) :]
+        if (
+            isinstance(change_context_raw, str)
+            and change_context_raw.lstrip().startswith("-")
+            and " +" in change_context_raw
+            and change_context_raw.strip().endswith("@@")
+        ):
+            change_context = None
+        else:
+            change_context = change_context_raw
         start_index = 1
     else:
         if not allow_missing_context:

@@ -32,6 +32,7 @@ from .aigc_detect import ProjectAIGCDetectTool
 from .web import WebFetchTool, WebSearchTool
 from .apply_patch_tool import ProjectApplyPatchTool
 from .apply_edits_tool import ProjectApplyEditsTool
+from .patch_tool import ProjectPatchTool
 
 __all__ = [
     "ToolRegistry",
@@ -70,4 +71,5 @@ __all__ = [
     "ProjectAIGCDetectTool",
     "ProjectApplyPatchTool",
     "ProjectApplyEditsTool",
+    "ProjectPatchTool",
 ]

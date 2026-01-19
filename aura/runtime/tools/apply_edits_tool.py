@@ -103,6 +103,74 @@ def list_apply_edits_target_paths(args: dict[str, Any]) -> list[str]:
     return out
 
 
+def gemini_compatible_apply_edits_input_schema() -> dict[str, Any]:
+    """
+    Gemini gateways often support only a limited JSON schema subset for tool parameters.
+
+    Constructs like `oneOf`/`anyOf`/`const` can be rejected with a 400 even before the model
+    responds. For Gemini tool declarations, Aura uses this simplified schema and relies on
+    runtime validation for strictness.
+    """
+
+    return {
+        "type": "object",
+        "properties": {
+            "ops": {
+                "type": "array",
+                "minItems": 1,
+                "description": (
+                    "Ordered list of edit operations.\n\n"
+                    "Supported ops (all are objects with an `op` field):\n"
+                    "- add_file: {path, content, overwrite?}\n"
+                    "- delete_file: {path}\n"
+                    "- move_file: {from, to}\n"
+                    "- update_file: {path, chunks, move_to?} where chunks[] = {change_context?, old_lines, new_lines, is_end_of_file?}\n"
+                    "- insert_before|insert_after: {path, anchor_lines, new_lines}\n"
+                    "- prepend_lines|append_lines: {path, new_lines} (or {path, lines} for back-compat)\n"
+                    "- replace_substring_first|replace_substring_all: {path, old, new, expected_count?}\n\n"
+                    "IMPORTANT: Matching is exact. Copy anchors/old text from `project__read_text`/`project__search_text`."
+                ),
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "op": {
+                            "type": "string",
+                            "enum": [
+                                "add_file",
+                                "delete_file",
+                                "move_file",
+                                "update_file",
+                                "insert_before",
+                                "insert_after",
+                                "prepend_lines",
+                                "append_lines",
+                                "replace_substring_first",
+                                "replace_substring_all",
+                            ],
+                            "description": "Operation kind.",
+                        }
+                    },
+                    "required": ["op"],
+                    "additionalProperties": True,
+                },
+            },
+            "dry_run": {"type": "boolean", "description": "Validate and preview without writing files (default false)."},
+            "max_diff_chars": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Max characters of diff text returned per changed file (default 8000).",
+            },
+            "max_diffs": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Max number of per-file diffs to return (default 10).",
+            },
+        },
+        "required": ["ops"],
+        "additionalProperties": False,
+    }
+
+
 def _require_str_field(obj: dict[str, Any], key: str) -> str:
     value = obj.get(key)
     if not isinstance(value, str) or not value.strip():
@@ -228,8 +296,9 @@ class ProjectApplyEditsTool:
         "Apply structured edit operations (JSON) to UTF-8 text files under the project root. "
         "This tool is strict and safe: edits only apply when anchors and old text match EXACTLY. "
         "Before calling, use `project__read_text`/`project__search_text` to copy exact `anchor_lines`/`old_lines`/substrings; never guess or paraphrase. "
-        "For deletion, set `chunks[].new_lines` to [] in `update_file`. "
-        "For insertion, prefer `insert_before`/`insert_after`/`prepend_lines`/`append_lines`. "
+        "Prefer `insert_before`/`insert_after`/`prepend_lines`/`append_lines` for simple line insertions. "
+        "Use `update_file` only when you can provide an explicit non-empty `chunks` list. "
+        "For deletion via `update_file`, set `chunks[].new_lines` to []. "
         "Returns per-file unified diffs for audit/UI. "
         "Operations are transactional: all ops are validated/applied in-memory first; writes happen only if all succeed."
     )
@@ -246,7 +315,7 @@ class ProjectApplyEditsTool:
                         "- add_file: {path, content, overwrite?}\n"
                         "- delete_file: {path}\n"
                         "- move_file: {from, to}\n"
-                        "- update_file: {path, chunks, move_to?} where chunks[] = {change_context?, old_lines, new_lines, is_end_of_file?}\n"
+                        "- update_file: {path, chunks, move_to?} where chunks[] = {change_context?, old_lines, new_lines, is_end_of_file?} (chunks MUST be non-empty)\n"
                         "- insert_before|insert_after: {path, anchor_lines, new_lines}\n"
                         "- prepend_lines|append_lines: {path, new_lines} (or {path, lines} for back-compat)\n"
                         "- replace_substring_first|replace_substring_all: {path, old, new, expected_count?}\n\n"
@@ -256,27 +325,138 @@ class ProjectApplyEditsTool:
                         "(including punctuation/whitespace). Do not infer or rewrite them."
                     ),
                     "items": {
-                        "type": "object",
-                        "properties": {
-                            "op": {
-                                "type": "string",
-                                "enum": [
-                                    "add_file",
-                                    "delete_file",
-                                    "move_file",
-                                    "update_file",
-                                    "insert_before",
-                                    "insert_after",
-                                    "prepend_lines",
-                                    "append_lines",
-                                    "replace_substring_first",
-                                    "replace_substring_all",
-                                ],
-                                "description": "Operation kind.",
-                            }
-                        },
-                        "required": ["op"],
-                        "additionalProperties": True,
+                        "oneOf": [
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "op": {"const": "add_file"},
+                                    "path": {"type": "string"},
+                                    "content": {"type": "string"},
+                                    "overwrite": {"type": "boolean"},
+                                },
+                                "required": ["op", "path", "content"],
+                                "additionalProperties": False,
+                            },
+                            {
+                                "type": "object",
+                                "properties": {"op": {"const": "delete_file"}, "path": {"type": "string"}},
+                                "required": ["op", "path"],
+                                "additionalProperties": False,
+                            },
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "op": {"const": "move_file"},
+                                    "from": {"type": "string"},
+                                    "to": {"type": "string"},
+                                    "expected_sha256": {"type": "string"},
+                                },
+                                "required": ["op", "from", "to"],
+                                "additionalProperties": False,
+                            },
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "op": {"const": "update_file"},
+                                    "path": {"type": "string"},
+                                    "move_to": {"type": "string"},
+                                    "expected_sha256": {"type": "string"},
+                                    "chunks": {
+                                        "type": "array",
+                                        "minItems": 1,
+                                        "items": {
+                                            "type": "object",
+                                            "properties": {
+                                                "change_context": {"type": ["string", "null"]},
+                                                "old_lines": {"type": "array", "items": {"type": "string"}},
+                                                "new_lines": {"type": "array", "items": {"type": "string"}},
+                                                "is_end_of_file": {"type": "boolean"},
+                                            },
+                                            "required": ["old_lines", "new_lines"],
+                                            "additionalProperties": False,
+                                        },
+                                    },
+                                },
+                                "required": ["op", "path", "chunks"],
+                                "additionalProperties": False,
+                            },
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "op": {"const": "insert_before"},
+                                    "path": {"type": "string"},
+                                    "anchor_lines": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+                                    "new_lines": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+                                    "expected_sha256": {"type": "string"},
+                                },
+                                "required": ["op", "path", "anchor_lines", "new_lines"],
+                                "additionalProperties": False,
+                            },
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "op": {"const": "insert_after"},
+                                    "path": {"type": "string"},
+                                    "anchor_lines": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+                                    "new_lines": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+                                    "expected_sha256": {"type": "string"},
+                                },
+                                "required": ["op", "path", "anchor_lines", "new_lines"],
+                                "additionalProperties": False,
+                            },
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "op": {"const": "prepend_lines"},
+                                    "path": {"type": "string"},
+                                    "new_lines": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+                                    "lines": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+                                    "expected_sha256": {"type": "string"},
+                                },
+                                "required": ["op", "path"],
+                                "anyOf": [{"required": ["new_lines"]}, {"required": ["lines"]}],
+                                "additionalProperties": False,
+                            },
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "op": {"const": "append_lines"},
+                                    "path": {"type": "string"},
+                                    "new_lines": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+                                    "lines": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+                                    "expected_sha256": {"type": "string"},
+                                },
+                                "required": ["op", "path"],
+                                "anyOf": [{"required": ["new_lines"]}, {"required": ["lines"]}],
+                                "additionalProperties": False,
+                            },
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "op": {"const": "replace_substring_first"},
+                                    "path": {"type": "string"},
+                                    "old": {"type": "string"},
+                                    "new": {"type": "string"},
+                                    "expected_sha256": {"type": "string"},
+                                    "expected_count": {"type": "integer", "minimum": 0},
+                                },
+                                "required": ["op", "path", "old", "new"],
+                                "additionalProperties": False,
+                            },
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "op": {"const": "replace_substring_all"},
+                                    "path": {"type": "string"},
+                                    "old": {"type": "string"},
+                                    "new": {"type": "string"},
+                                    "expected_sha256": {"type": "string"},
+                                    "expected_count": {"type": "integer", "minimum": 0},
+                                },
+                                "required": ["op", "path", "old", "new"],
+                                "additionalProperties": False,
+                            },
+                        ]
                     },
                 },
                 "dry_run": {"type": "boolean", "description": "Validate and preview without writing files (default false)."},

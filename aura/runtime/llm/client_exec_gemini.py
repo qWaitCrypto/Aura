@@ -311,6 +311,29 @@ def stream_gemini(
         resp = stream_ctx.__enter__()
         resp.raise_for_status()
     except Exception as e:
+        try:
+            import httpx  # type: ignore
+
+            if isinstance(e, httpx.HTTPStatusError):
+                body = ""
+                try:
+                    body = e.response.text or ""
+                except Exception:
+                    body = ""
+                if trace is not None:
+                    try:
+                        trace.write_json(
+                            "provider_error_response.json",
+                            {
+                                "status_code": int(e.response.status_code),
+                                "headers": dict(e.response.headers),
+                                "text": body[:4000],
+                            },
+                        )
+                    except Exception:
+                        pass
+        except Exception:
+            pass
         raise _wrap_httpx_like_exception(
             e,
             provider_kind=profile.provider_kind,

@@ -55,8 +55,10 @@ class ProjectApplyPatchTool:
     name: str = "project__apply_patch"
     description: str = (
         "Apply a multi-file patch in Codex apply_patch format to UTF-8 text files under the project root. "
-        "The patch MUST be the raw patch text (no markdown fences) and MUST start with '*** Begin Patch' and end with '*** End Patch'. "
-        "Do not pass unified diffs starting with '---'/'+++'."
+        "The patch MUST be raw text (no ``` fences) and MUST start with '*** Begin Patch' and end with '*** End Patch'. "
+        "This is NOT unified diff: do not use '---'/'+++', and do not use range headers like '@@ -10,6 +11,7 @@'. "
+        "Hunk headers must be one of: '*** Add File: <path>', '*** Delete File: <path>', '*** Update File: <path>'. "
+        "Inside an update hunk, every change line must start with ' ' (context), '+' (add), or '-' (remove)."
     )
     input_schema: dict[str, Any] = field(
         default_factory=lambda: {
@@ -66,7 +68,14 @@ class ProjectApplyPatchTool:
                     "type": "string",
                     "description": (
                         "Raw patch text in apply_patch format. "
-                        "Do not wrap in ``` fences. Must start with '*** Begin Patch'."
+                        "Do not wrap in ``` fences. Must start with '*** Begin Patch'.\n\n"
+                        "Example:\n"
+                        "*** Begin Patch\n"
+                        "*** Update File: README.md\n"
+                        "@@\n"
+                        "-old line\n"
+                        "+new line\n"
+                        "*** End Patch"
                     ),
                 },
                 "dry_run": {"type": "boolean", "description": "Validate and preview without writing files (default false)."},

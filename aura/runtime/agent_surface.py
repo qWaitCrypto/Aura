@@ -42,11 +42,11 @@ def build_agent_surface(
                 "- For `update_file`/`insert_*`/`replace_substring_*`, copy exact lines/substrings via `project__read_text`/`project__search_text` (no guessing).",
             ]
         )
-    if "project__apply_patch" in tool_names:
+    if "project__patch" in tool_names:
         tool_notes.extend(
             [
-                "- `project__apply_patch` expects Codex apply_patch format, NOT unified diff (`---/+++`).",
-                "- Patch must start with `*** Begin Patch` and end with `*** End Patch` (no ``` fences).",
+                "- Use `project__patch` for patch-style edits; it accepts unified diff (`---/+++`, `@@`) like `git diff`.",
+                "- Pass raw diff text (no ``` fences).",
             ]
         )
 

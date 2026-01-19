@@ -140,7 +140,7 @@ class ConsoleUI:
             "mcp__list_tools",
         } or tool_name.startswith("skill__"):
             return "Explored"
-        if tool_name in {"project__apply_patch", "project__apply_edits"}:
+        if tool_name in {"project__apply_patch", "project__apply_edits", "project__patch"}:
             return "Edited"
         if tool_name == "update_plan":
             return "Planned"
@@ -197,6 +197,24 @@ class ConsoleUI:
                 self._println_dim(out)
             else:
                 self._println(out)
+
+    def _maybe_color_diff_preview_line(self, line: str) -> str:
+        if not self._enable_color:
+            return line
+        s = str(line)
+        stripped = s.lstrip()
+        if not stripped:
+            return s
+        if stripped[0].isdigit():
+            try:
+                rest = stripped.split(None, 1)[1]
+            except Exception:
+                rest = ""
+            if rest.startswith("-"):
+                return self._color(s, "31")
+            if rest.startswith("+"):
+                return self._color(s, "32")
+        return s
 
     # --- lifecycle ---
     def start(self) -> None:
@@ -397,7 +415,7 @@ class ConsoleUI:
                 suffix = " (" + "; ".join(suffix_parts) + ")"
 
             category = self._tool_category(tool)
-            suppress_summary = tool == "project__apply_patch" and isinstance(details, list) and details
+            suppress_summary = tool in {"project__apply_patch", "project__patch"} and isinstance(details, list) and details
             if not suppress_summary:
                 self._queue_tool_item(category=category, line=summary + suffix)
             if isinstance(details, list):
@@ -406,7 +424,7 @@ class ConsoleUI:
                         continue
                     s = item.rstrip("\r\n")
                     if s.strip():
-                        self._queue_tool_item(category=category, line=s)
+                        self._queue_tool_item(category=category, line=self._maybe_color_diff_preview_line(s))
             return
 
         if k is UIEventKind.PLAN_UPDATED:

@@ -27,6 +27,124 @@ def _elide_tail(s: str, max_chars: int) -> str:
     return s[: max(0, max_chars - 1)].rstrip() + "…"
 
 
+def _diff_add_del_counts(unified_diff_text: str) -> tuple[int, int]:
+    adds = 0
+    dels = 0
+    for line in str(unified_diff_text).splitlines():
+        if line.startswith("+++ ") or line.startswith("--- "):
+            continue
+        if line.startswith("+"):
+            adds += 1
+            continue
+        if line.startswith("-"):
+            dels += 1
+            continue
+    return adds, dels
+
+
+def _unified_diff_changed_lines(unified_diff_text: str, *, max_lines: int = 12, max_line_chars: int = 180) -> list[str]:
+    """
+    Return a compact preview of changed lines with line numbers.
+
+    We only show +/- lines (no context), and use line numbers implied by unified diff hunk headers:
+      @@ -old_start,old_len +new_start,new_len @@
+    """
+
+    lines = str(unified_diff_text).splitlines()
+    out: list[str] = []
+
+    old_line_no: int | None = None
+    new_line_no: int | None = None
+
+    def _parse_hunk_header(h: str) -> tuple[int, int] | None:
+        if not h.startswith("@@"):
+            return None
+        try:
+            parts = h.split()
+            old_part = next(p for p in parts if p.startswith("-"))
+            new_part = next(p for p in parts if p.startswith("+"))
+            old_start = int(old_part[1:].split(",")[0])
+            new_start = int(new_part[1:].split(",")[0])
+            return old_start, new_start
+        except Exception:
+            return None
+
+    saw_any = False
+    for line in lines:
+        if line.startswith("--- ") or line.startswith("+++ "):
+            continue
+        if line.startswith("@@"):
+            parsed = _parse_hunk_header(line)
+            if parsed is not None:
+                if saw_any and out and out[-1].strip() != "⋮":
+                    out.append(f"{'':>5}  ⋮")
+                old_line_no, new_line_no = parsed
+                saw_any = True
+            else:
+                old_line_no, new_line_no = None, None
+            continue
+
+        if old_line_no is None or new_line_no is None:
+            continue
+
+        if line.startswith(" "):
+            old_line_no += 1
+            new_line_no += 1
+            continue
+        if line.startswith("-"):
+            out.append(f"{old_line_no:>5} {_elide_tail(line, max_line_chars)}")
+            old_line_no += 1
+        elif line.startswith("+"):
+            out.append(f"{new_line_no:>5} {_elide_tail(line, max_line_chars)}")
+            new_line_no += 1
+        else:
+            continue
+
+        if len(out) >= max_lines:
+            break
+
+    return out
+
+
+def file_edit_ui_details(*, diffs: list[dict[str, Any]] | None, changed_files: list[str] | None) -> list[str] | None:
+    if not isinstance(diffs, list) or not diffs:
+        return None
+
+    total_changed = len(changed_files) if isinstance(changed_files, list) else None
+
+    out: list[str] = []
+    file_headers = 0
+    for item in diffs:
+        if not isinstance(item, dict):
+            continue
+        path = item.get("path")
+        if not isinstance(path, str) or not path.strip():
+            continue
+        diff_text = item.get("diff") or ""
+        adds, dels = _diff_add_del_counts(str(diff_text))
+        suffix = f"(+{adds} -{dels})"
+        if item.get("truncated") is True:
+            suffix += " (diff truncated)"
+        moved_from = item.get("moved_from")
+        if isinstance(moved_from, str) and moved_from.strip():
+            out.append(f"• Edited {path.strip()} {suffix} (moved from {moved_from.strip()})")
+        else:
+            out.append(f"• Edited {path.strip()} {suffix}")
+        file_headers += 1
+
+        preview = _unified_diff_changed_lines(str(diff_text))
+        out.extend(preview)
+        out.append("")
+
+    if out and out[-1] == "":
+        out.pop()
+
+    if total_changed is not None and total_changed > file_headers:
+        out.append(f"... ({total_changed - file_headers} more file(s))")
+
+    return out or None
+
+
 def _summarize_shell_run_args(args: dict[str, Any], *, max_chars: int = 120) -> str:
     command = args.get("command")
     if not isinstance(command, str) or not command.strip():
@@ -256,6 +374,36 @@ class ToolRuntime:
                 diff_ref=diff_ref,
             )
 
+        if planned.tool_name in {"project__apply_patch", "project__apply_edits", "project__patch"}:
+            try:
+                if planned.tool_name == "project__apply_patch":
+                    diff_ref = self._build_apply_patch_preview(planned)
+                    action = "Apply patch"
+                elif planned.tool_name == "project__patch":
+                    diff_ref = self._build_project_patch_preview(planned)
+                    action = "Apply patch"
+                else:
+                    diff_ref = self._build_apply_edits_preview(planned)
+                    action = "Apply edits"
+            except Exception as e:
+                code = _classify_tool_exception(e)
+                return InspectionResult(
+                    decision=InspectionDecision.DENY,
+                    action_summary="Invalid file edit request.",
+                    risk_level="high",
+                    reason=str(e),
+                    error_code=code,
+                    diff_ref=None,
+                )
+            return InspectionResult(
+                decision=InspectionDecision.REQUIRE_APPROVAL,
+                action_summary=action,
+                risk_level="high",
+                reason="This tool modifies project files; approval required in standard mode.",
+                error_code=None,
+                diff_ref=diff_ref,
+            )
+
         return InspectionResult(
             decision=InspectionDecision.ALLOW,
             action_summary=f"Execute tool: {planned.tool_name}",
@@ -283,7 +431,7 @@ class ToolRuntime:
         if not sealed:
             return None
         tool_name = planned.tool_name
-        if tool_name in {"project__apply_patch", "project__apply_edits"}:
+        if tool_name in {"project__apply_patch", "project__apply_edits", "project__patch"}:
             try:
                 if tool_name == "project__apply_patch":
                     patch_text = planned.arguments.get("patch")
@@ -291,6 +439,14 @@ class ToolRuntime:
                         from .apply_patch_tool import list_patch_target_paths
 
                         targets = list_patch_target_paths(patch_text)
+                    else:
+                        targets = []
+                elif tool_name == "project__patch":
+                    diff_text = planned.arguments.get("diff")
+                    if isinstance(diff_text, str) and diff_text.strip():
+                        from .patch_tool import unified_diff_target_paths
+
+                        targets = unified_diff_target_paths(diff_text)
                     else:
                         targets = []
                 else:
@@ -389,16 +545,80 @@ class ToolRuntime:
             meta={"summary": "Shell command preview"},
         )
 
+    def _format_file_edit_preview(
+        self, *, title: str, changed_files: list[str] | None, diffs: list[dict[str, Any]] | None
+    ) -> str:
+        lines: list[str] = [title, ""]
+        details = file_edit_ui_details(diffs=diffs, changed_files=changed_files)
+        if not details:
+            lines.append("(no diff preview available)")
+            return "\n".join(lines).rstrip() + "\n"
+        lines.extend(details)
+        return "\n".join(lines).rstrip() + "\n"
+
     def _build_apply_patch_preview(self, planned: PlannedToolCall) -> ArtifactRef:
         patch_text = planned.arguments.get("patch")
         if not isinstance(patch_text, str) or not patch_text.strip():
             raise ValueError("project__apply_patch: missing patch")
-        # The patch is itself a diff-like artifact; store it for review (bounded).
-        max_chars = 20000
-        preview = patch_text.strip()
-        if len(preview) > max_chars:
-            preview = preview[:max_chars] + "\n…(truncated)"
-        return self._artifact_store.put(preview, kind="diff", meta={"summary": "Patch preview"})
+        from .apply_patch_tool import ProjectApplyPatchTool
+
+        args: dict[str, Any] = {"patch": patch_text, "dry_run": True}
+        max_diff_chars = planned.arguments.get("max_diff_chars")
+        max_diffs = planned.arguments.get("max_diffs")
+        if isinstance(max_diff_chars, int) and max_diff_chars >= 1:
+            args["max_diff_chars"] = max_diff_chars
+        if isinstance(max_diffs, int) and max_diffs >= 1:
+            args["max_diffs"] = max_diffs
+
+        tool = ProjectApplyPatchTool()
+        result = tool.execute(args=args, project_root=self._project_root)
+        preview = self._format_file_edit_preview(
+            title="project__apply_patch (dry-run preview)",
+            changed_files=result.get("changed_files") if isinstance(result, dict) else None,
+            diffs=result.get("diffs") if isinstance(result, dict) else None,
+        )
+        preview = _elide_tail(preview, 100_000)
+        return self._artifact_store.put(preview, kind="diff", meta={"summary": "Patch dry-run diff preview"})
+
+    def _build_apply_edits_preview(self, planned: PlannedToolCall) -> ArtifactRef:
+        from .apply_edits_tool import ProjectApplyEditsTool
+
+        args: dict[str, Any] = dict(planned.arguments)
+        args["dry_run"] = True
+
+        tool = ProjectApplyEditsTool()
+        result = tool.execute(args=args, project_root=self._project_root)
+        preview = self._format_file_edit_preview(
+            title="project__apply_edits (dry-run preview)",
+            changed_files=result.get("changed_files") if isinstance(result, dict) else None,
+            diffs=result.get("diffs") if isinstance(result, dict) else None,
+        )
+        preview = _elide_tail(preview, 100_000)
+        return self._artifact_store.put(preview, kind="diff", meta={"summary": "Edits dry-run diff preview"})
+
+    def _build_project_patch_preview(self, planned: PlannedToolCall) -> ArtifactRef:
+        diff_text = planned.arguments.get("diff")
+        if not isinstance(diff_text, str) or not diff_text.strip():
+            raise ValueError("project__patch: missing diff")
+        from .patch_tool import ProjectPatchTool
+
+        args: dict[str, Any] = {"diff": diff_text, "dry_run": True}
+        max_diff_chars = planned.arguments.get("max_diff_chars")
+        max_diffs = planned.arguments.get("max_diffs")
+        if isinstance(max_diff_chars, int) and max_diff_chars >= 1:
+            args["max_diff_chars"] = max_diff_chars
+        if isinstance(max_diffs, int) and max_diffs >= 1:
+            args["max_diffs"] = max_diffs
+
+        tool = ProjectPatchTool()
+        result = tool.execute(args=args, project_root=self._project_root)
+        preview = self._format_file_edit_preview(
+            title="project__patch (dry-run preview)",
+            changed_files=result.get("changed_files") if isinstance(result, dict) else None,
+            diffs=result.get("diffs") if isinstance(result, dict) else None,
+        )
+        preview = _elide_tail(preview, 100_000)
+        return self._artifact_store.put(preview, kind="diff", meta={"summary": "Patch dry-run diff preview"})
 
     def _inspect_strict(self, planned: PlannedToolCall) -> InspectionResult:
         tool_name = planned.tool_name
@@ -420,6 +640,50 @@ class ToolRuntime:
             return InspectionResult(
                 decision=InspectionDecision.REQUIRE_APPROVAL,
                 action_summary="Apply patch",
+                risk_level="high",
+                reason="Strict mode: approve every tool call.",
+                error_code=None,
+                diff_ref=diff_ref,
+            )
+
+        if tool_name == "project__patch":
+            try:
+                diff_ref = self._build_project_patch_preview(planned)
+            except Exception as e:
+                code = _classify_tool_exception(e)
+                return InspectionResult(
+                    decision=InspectionDecision.DENY,
+                    action_summary="Invalid patch request.",
+                    risk_level="high",
+                    reason=str(e),
+                    error_code=code,
+                    diff_ref=None,
+                )
+            return InspectionResult(
+                decision=InspectionDecision.REQUIRE_APPROVAL,
+                action_summary="Apply patch",
+                risk_level="high",
+                reason="Strict mode: approve every tool call.",
+                error_code=None,
+                diff_ref=diff_ref,
+            )
+
+        if tool_name == "project__apply_edits":
+            try:
+                diff_ref = self._build_apply_edits_preview(planned)
+            except Exception as e:
+                code = _classify_tool_exception(e)
+                return InspectionResult(
+                    decision=InspectionDecision.DENY,
+                    action_summary="Invalid edits request.",
+                    risk_level="high",
+                    reason=str(e),
+                    error_code=code,
+                    diff_ref=None,
+                )
+            return InspectionResult(
+                decision=InspectionDecision.REQUIRE_APPROVAL,
+                action_summary="Apply edits",
                 risk_level="high",
                 reason="Strict mode: approve every tool call.",
                 error_code=None,
