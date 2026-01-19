@@ -81,6 +81,9 @@ def _summarize_tool_for_ui(tool_name: str, arguments: dict[str, Any]) -> str:
     if tool_name == "project__apply_patch":
         return "Apply patch"
 
+    if tool_name == "project__patch":
+        return "Apply patch"
+
     if tool_name == "project__apply_edits":
         ops = arguments.get("ops")
         if isinstance(ops, list) and ops:

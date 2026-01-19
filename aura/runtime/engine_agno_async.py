@@ -4,6 +4,7 @@ import asyncio
 import json
 import threading
 import time
+from copy import deepcopy
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field, replace
 from hashlib import sha256
@@ -42,7 +43,12 @@ from .llm.types import (
     ToolCall,
     ToolSpec,
 )
-from .orchestrator_helpers import _canonical_request_to_redacted_dict, _summarize_text, _tool_calls_from_payload
+from .orchestrator_helpers import (
+    _canonical_request_to_redacted_dict,
+    _summarize_text,
+    _summarize_tool_for_ui,
+    _tool_calls_from_payload,
+)
 from .plan import PlanStore
 from .protocol import ArtifactRef, Event, EventKind, Op, OpKind
 from .run_snapshots import PendingToolCall as SnapshotPendingToolCall
@@ -56,6 +62,7 @@ from .tools import (
     ProjectAIGCDetectTool,
     ProjectApplyEditsTool,
     ProjectApplyPatchTool,
+    ProjectPatchTool,
     ProjectGlobTool,
     ProjectListDirTool,
     ProjectReadTextManyTool,
@@ -89,6 +96,7 @@ from .tools.runtime import (
     ToolExecutionContext,
     ToolRuntime,
     _classify_tool_exception,
+    file_edit_ui_details,
 )
 
 from .engine import PendingToolCall, RunResult, ToolDecision
@@ -130,6 +138,39 @@ def _normalize_tool_calls(tool_calls: list[ToolCall] | None) -> list[ToolCall]:
             )
         )
     return out
+
+
+_DEFAULT_EXPOSED_TOOL_NAMES: set[str] = {
+    # Project filesystem (read + navigate)
+    "project__read_text",
+    "project__read_text_many",
+    "project__search_text",
+    "project__list_dir",
+    "project__glob",
+    "project__text_stats",
+    # Project filesystem (write)
+    "project__apply_edits",
+    "project__patch",
+    # System / network (approval-gated)
+    "shell__run",
+    "web__fetch",
+    "web__search",
+    # Session / skills / planning
+    "session__search",
+    "session__export",
+    "skill__list",
+    "skill__load",
+    "skill__read_file",
+    "update_plan",
+    # Spec workflow
+    "spec__query",
+    "spec__get",
+    "spec__propose",
+    "spec__apply",
+    "spec__seal",
+    # Subagents
+    "subagent__run",
+}
 
 
 @dataclass(slots=True)
@@ -188,6 +229,7 @@ class AgnoAsyncEngine:
         registry.register(ProjectReadTextTool())
         registry.register(ProjectApplyEditsTool())
         registry.register(ProjectApplyPatchTool())
+        registry.register(ProjectPatchTool())
         registry.register(ProjectSearchTextTool())
         registry.register(ProjectListDirTool())
         registry.register(ProjectGlobTool())
@@ -665,7 +707,7 @@ class AgnoAsyncEngine:
             guard_id = str(turn_id or request_id)
             while True:
                 # Build system prompt and tool surface (Aura tools + MCP tools).
-                request = self._build_request(extra_tools=mcp_specs)
+                request = self._build_request(profile=profile, extra_tools=mcp_specs)
                 context_limit_tokens = resolve_context_limit_tokens(
                     profile.limits.context_limit_tokens if profile.limits is not None else None
                 )
@@ -765,6 +807,20 @@ class AgnoAsyncEngine:
                             tool_call_id=planned.tool_call_id,
                             tool_name=planned.tool_name,
                         )
+                    )
+
+                # Tool messages were appended to history; rebuild request and token estimates before resuming the loop.
+                request = self._build_request(profile=profile, extra_tools=mcp_specs)
+                estimated_input_tokens = approx_tokens_from_json(canonical_request_to_dict(request))
+                context_stats = {
+                    "estimated_input_tokens": estimated_input_tokens,
+                    "estimate_kind": "bytes_per_token_4",
+                    "context_limit_tokens": context_limit_tokens,
+                }
+                if isinstance(context_limit_tokens, int) and context_limit_tokens > 0:
+                    context_stats["estimated_context_left_percent"] = compute_context_left_percent(
+                        used_tokens=estimated_input_tokens,
+                        context_limit_tokens=context_limit_tokens,
                     )
 
             # Main model/tool loop.
@@ -950,7 +1006,7 @@ class AgnoAsyncEngine:
                         )
                     )
 
-                request = self._build_request(extra_tools=mcp_specs)
+                request = self._build_request(profile=profile, extra_tools=mcp_specs)
 
             await self._emit(
                 kind=EventKind.OPERATION_FAILED,
@@ -1167,7 +1223,7 @@ class AgnoAsyncEngine:
         except Exception:
             pass
 
-        post_request = self._build_request(extra_tools=extra_tools)
+        post_request = self._build_request(profile=profile, extra_tools=extra_tools)
         post_estimated_input_tokens = approx_tokens_from_json(canonical_request_to_dict(post_request))
         post_stats: dict[str, Any] = {
             "estimated_input_tokens": post_estimated_input_tokens,
@@ -1348,12 +1404,68 @@ class AgnoAsyncEngine:
                 pass
         return final
 
-    def _build_request(self, *, extra_tools: list[ToolSpec] | None = None) -> CanonicalRequest:
+    def _adapt_tool_specs_for_profile(self, *, tools: list[ToolSpec], profile: ModelProfile) -> list[ToolSpec]:
+        """
+        Some providers validate tool parameter schemas strictly and only support a subset of JSON Schema.
+
+        Example: Gemini gateways may reject `oneOf`/`anyOf`/`const` in tool parameter schemas with a 400,
+        even before the model generates output. Aura keeps strict schemas for local/runtime validation, but
+        adapts the *declared* tool schemas for compatibility at request time.
+        """
+
+        if profile.provider_kind is not ProviderKind.GEMINI:
+            return tools
+
+        def _strip_unsupported(obj: Any) -> None:
+            if isinstance(obj, dict):
+                # Remove higher-order schema constructs that are frequently unsupported.
+                obj.pop("oneOf", None)
+                obj.pop("anyOf", None)
+                obj.pop("allOf", None)
+                # Convert `const` to `enum` (best-effort).
+                if "const" in obj:
+                    const_val = obj.pop("const")
+                    if "enum" not in obj:
+                        obj["enum"] = [const_val]
+                for v in list(obj.values()):
+                    _strip_unsupported(v)
+            elif isinstance(obj, list):
+                for v in obj:
+                    _strip_unsupported(v)
+
+        from .tools.apply_edits_tool import gemini_compatible_apply_edits_input_schema
+
+        out: list[ToolSpec] = []
+        for spec in tools:
+            if spec.name == "project__apply_edits":
+                schema = gemini_compatible_apply_edits_input_schema()
+            else:
+                schema = deepcopy(spec.input_schema) if isinstance(spec.input_schema, dict) else {"type": "object", "properties": {}}
+                _strip_unsupported(schema)
+                if spec.name == "subagent__run":
+                    # Simplify union types in context.files.items for Gemini schema compatibility.
+                    try:
+                        ctx = schema.get("properties", {}).get("context")
+                        files = ctx.get("properties", {}).get("files") if isinstance(ctx, dict) else None
+                        if isinstance(files, dict) and isinstance(files.get("items"), dict):
+                            files["items"] = {"type": "string"}
+                    except Exception:
+                        pass
+
+            out.append(ToolSpec(name=spec.name, description=spec.description, input_schema=schema))
+        return out
+
+    def _build_request(self, *, profile: ModelProfile | None = None, extra_tools: list[ToolSpec] | None = None) -> CanonicalRequest:
         tools: list[ToolSpec] = []
         if self.tools_enabled and self.tool_registry is not None:
-            tools = [t for t in self.tool_registry.list_specs() if t.name != "project__apply_patch"]
+            tools = [t for t in self.tool_registry.list_specs() if t.name in _DEFAULT_EXPOSED_TOOL_NAMES]
         if extra_tools:
             tools = [*tools, *list(extra_tools)]
+        if profile is not None and tools:
+            try:
+                tools = self._adapt_tool_specs_for_profile(tools=tools, profile=profile)
+            except Exception:
+                pass
         skills = self.skill_store.list()
         plan = self.plan_store.get().plan
 
@@ -1489,6 +1601,8 @@ class AgnoAsyncEngine:
                     planned_calls=planned_calls,
                     context_stats=context_stats,
                     model_profile_id=model_profile_id,
+                    inspection=inspection,
+                    focus_tool_call_id=planned.tool_call_id,
                 )
                 return True
         return False
@@ -1743,8 +1857,36 @@ class AgnoAsyncEngine:
         planned_calls: list[PlannedToolCall],
         context_stats: dict[str, Any],
         model_profile_id: str | None,
+        inspection: Any | None,
+        focus_tool_call_id: str | None,
     ) -> str:
         approval_id = new_id("appr")
+        action_summary = f"Approve to execute {len(planned_calls)} tool call(s)."
+        risk_level = "high"
+        reason = "Tool calls require approval."
+        diff_ref = None
+        if inspection is not None:
+            try:
+                summary = getattr(inspection, "action_summary", None)
+                if isinstance(summary, str) and summary.strip():
+                    action_summary = summary.strip()
+                    if len(planned_calls) > 1:
+                        action_summary = f"{action_summary} (+{len(planned_calls) - 1} more)"
+                level = getattr(inspection, "risk_level", None)
+                if isinstance(level, str) and level.strip():
+                    risk_level = level.strip()
+                why = getattr(inspection, "reason", None)
+                if isinstance(why, str) and why.strip():
+                    reason = why.strip()
+                ref = getattr(inspection, "diff_ref", None)
+                if ref is not None:
+                    try:
+                        diff_ref = ref.to_dict()
+                    except Exception:
+                        diff_ref = None
+            except Exception:
+                pass
+
         record = ApprovalRecord(
             approval_id=approval_id,
             session_id=self.session_id,
@@ -1752,11 +1894,11 @@ class AgnoAsyncEngine:
             created_at=now_ts_ms(),
             status=ApprovalStatus.PENDING,
             turn_id=turn_id,
-            action_summary=f"Approve to execute {len(planned_calls)} tool call(s).",
-            risk_level="high",
+            action_summary=action_summary,
+            risk_level=risk_level,
             options=["approve", "deny"],
-            reason="Tool calls require approval.",
-            diff_ref=None,
+            reason=reason,
+            diff_ref=diff_ref,
             resume_kind="run_continue",
             resume_payload={
                 "tool_calls": [
@@ -1775,6 +1917,7 @@ class AgnoAsyncEngine:
                 "options": record.options,
                 "reason": record.reason,
                 "diff_ref": record.diff_ref,
+                "focus_tool_call_id": focus_tool_call_id,
             },
             request_id=request_id,
             turn_id=turn_id,
@@ -1896,23 +2039,52 @@ class AgnoAsyncEngine:
         )
         tool_message = json.dumps({"ok": True, "tool": planned.tool_name, "output_ref": output_ref.to_dict(), "result": raw}, ensure_ascii=False)
         tool_message_ref = self.artifact_store.put(tool_message, kind="tool_message", meta={"summary": f"{planned.tool_name} tool_result"})
+
+        details = None
+        if planned.tool_name in {"project__apply_edits", "project__apply_patch", "project__patch"} and isinstance(raw, dict):
+            try:
+                details = file_edit_ui_details(
+                    diffs=raw.get("diffs") if isinstance(raw.get("diffs"), list) else None,
+                    changed_files=raw.get("changed_files") if isinstance(raw.get("changed_files"), list) else None,
+                )
+            except Exception:
+                details = None
         await self._emit(
             kind=EventKind.TOOL_CALL_END,
             payload={
                 "tool_execution_id": planned.tool_execution_id,
                 "tool_name": planned.tool_name,
                 "tool_call_id": planned.tool_call_id,
+                "summary": _summarize_tool_for_ui(planned.tool_name, planned.arguments),
                 "status": "succeeded",
                 "duration_ms": duration_ms,
                 "output_ref": output_ref.to_dict(),
                 "tool_message_ref": tool_message_ref.to_dict(),
                 "error_code": None,
                 "error": None,
+                "details": details,
             },
             request_id=request_id,
             turn_id=turn_id,
             step_id=planned.tool_execution_id,
         )
+
+        if planned.tool_name == "update_plan":
+            try:
+                state = self.plan_store.get()
+                await self._emit(
+                    kind=EventKind.PLAN_UPDATE,
+                    payload={
+                        "plan": [t.to_dict() for t in state.plan],
+                        "explanation": state.explanation,
+                        "updated_at": state.updated_at,
+                    },
+                    request_id=request_id,
+                    turn_id=turn_id,
+                    step_id=planned.tool_execution_id,
+                )
+            except Exception:
+                pass
         return tool_message
 
     async def _tool_result_denied(
