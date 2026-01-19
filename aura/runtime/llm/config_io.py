@@ -193,8 +193,8 @@ def _parse_registry_profile(profile_id: str, profile_dict: dict[str, Any], *, so
         credential_ref = None
         if provider_kind is ProviderKind.ANTHROPIC:
             raise ModelConfigError(f"{source}:profiles.{profile_id}: api_key is required for provider_kind=anthropic")
-        if provider_kind is ProviderKind.GEMINI_INTERNAL:
-            raise ModelConfigError(f"{source}:profiles.{profile_id}: api_key is required for provider_kind=gemini_internal")
+        if provider_kind is ProviderKind.GEMINI:
+            raise ModelConfigError(f"{source}:profiles.{profile_id}: api_key is required for provider_kind=gemini")
 
     timeout_s = None
     if "timeout_s" in profile_dict and profile_dict["timeout_s"] is not None:
@@ -214,7 +214,18 @@ def _parse_registry_profile(profile_id: str, profile_dict: dict[str, Any], *, so
         default_params = dict(default_params_obj)
 
     if max_tokens is not None:
-        default_params.setdefault("max_tokens", max_tokens)
+        if provider_kind is ProviderKind.GEMINI:
+            gen = default_params.get("generationConfig")
+            if gen is None:
+                default_params["generationConfig"] = {"maxOutputTokens": max_tokens}
+            elif isinstance(gen, dict):
+                gen.setdefault("maxOutputTokens", max_tokens)
+            else:
+                raise ModelConfigError(
+                    f"{source}:profiles.{profile_id}: generationConfig must be an object when max_tokens is set for provider_kind=gemini"
+                )
+        else:
+            default_params.setdefault("max_tokens", max_tokens)
 
     if provider_kind is ProviderKind.ANTHROPIC and "max_tokens" not in default_params:
         raise ModelConfigError(f"{source}:profiles.{profile_id}: max_tokens is required for provider_kind=anthropic")

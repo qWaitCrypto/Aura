@@ -65,12 +65,6 @@ def complete_openai_compatible(
     client = OpenAI(api_key=api_key, base_url=profile.base_url, max_retries=0)
     payload = OpenAICompatibleAdapter().prepare_request(profile, request).json
     request_timeout_s = timeout_s if timeout_s is not None else profile.timeout_s
-    stream_options = payload.get("stream_options")
-    if stream_options is None:
-        payload["stream_options"] = {"include_usage": True}
-    elif isinstance(stream_options, dict):
-        if stream_options.get("include_usage") is None:
-            stream_options["include_usage"] = True
     if trace is not None:
         trace.record_prepared_request(
             provider_kind=profile.provider_kind,
@@ -81,12 +75,46 @@ def complete_openai_compatible(
             timeout_s=request_timeout_s,
             payload=payload,
         )
+    _raise_if_cancelled(
+        cancel,
+        provider_kind=profile.provider_kind,
+        profile_id=profile.profile_id,
+        model=profile.model_name,
+        operation="complete",
+    )
     try:
         if request_timeout_s is not None:
             resp = client.chat.completions.create(**payload, timeout=request_timeout_s)
         else:
             resp = client.chat.completions.create(**payload)
     except openai.OpenAIError as e:
+        if trace is not None:
+            try:
+                resp = getattr(e, "response", None)
+                headers = None
+                text = None
+                if resp is not None:
+                    try:
+                        headers = dict(getattr(resp, "headers", {}) or {})
+                    except Exception:
+                        headers = None
+                    try:
+                        text = resp.text  # httpx.Response.text
+                    except Exception:
+                        text = None
+                trace.write_json(
+                    "provider_error_response.json",
+                    {
+                        "status_code": getattr(e, "status_code", None),
+                        "request_id": getattr(e, "request_id", None),
+                        "body": getattr(e, "body", None),
+                        "headers": headers,
+                        "text": (text[:4000] if isinstance(text, str) else None),
+                        "message": str(e),
+                    },
+                )
+            except Exception:
+                pass
         raise wrap_provider_exception(
             e,
             provider_kind=profile.provider_kind,

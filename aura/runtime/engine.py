@@ -58,12 +58,17 @@ class Engine(Protocol):
     tools_enabled: bool
     tool_runtime: ToolRuntime | None
     memory_summary: str | None
+    llm_streaming: bool
 
     def load_history_from_events(self) -> None: ...
 
     def apply_memory_summary_retention(self) -> None: ...
 
     def set_chat_model_profile(self, profile_id: str) -> None: ...
+
+    def get_llm_streaming(self) -> bool: ...
+
+    def set_llm_streaming(self, enabled: bool) -> None: ...
 
     async def arun(
         self,

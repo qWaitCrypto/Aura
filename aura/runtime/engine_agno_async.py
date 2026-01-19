@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 import time
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field, replace
@@ -21,16 +22,23 @@ from .error_codes import ErrorCode
 from .event_bus import EventBus
 from .ids import new_id, now_ts_ms
 from .llm.config import ModelConfig
-from .llm.errors import CancellationToken, ModelResolutionError
+from .llm.client_exec_anthropic import complete_anthropic, stream_anthropic
+from .llm.client_exec_gemini import complete_gemini, stream_gemini
+from .llm.client_exec_openai_compatible import complete_openai_compatible, stream_openai_compatible
+from .llm.errors import CancellationToken, LLMRequestError, ModelResolutionError
 from .llm.router import ModelRouter
+from .llm.trace import LLMTrace
 from .llm.types import (
     CanonicalMessage,
     CanonicalMessageRole,
     CanonicalRequest,
     LLMResponse,
-    LLMUsage,
+    LLMStreamEvent,
+    LLMStreamEventKind,
     ModelRequirements,
     ModelRole,
+    ModelProfile,
+    ProviderKind,
     ToolCall,
     ToolSpec,
 )
@@ -99,35 +107,29 @@ def _load_default_system_prompt() -> str:
         return "You are Aura, a terminal-based agent.\n"
 
 
-def _agno_usage_to_aura_usage(metrics: Any) -> LLMUsage | None:
-    if metrics is None:
-        return None
+def _normalize_tool_calls(tool_calls: list[ToolCall] | None) -> list[ToolCall]:
+    """
+    Normalize provider tool calls for Aura's tool loop.
 
-    def _int_or_none(val: Any) -> int | None:
-        if isinstance(val, bool) or not isinstance(val, int):
-            return None
-        if val <= 0:
-            return None
-        return int(val)
+    - Ensure every tool call has a stable id (required for tool result linking).
+    - Strip provider-specific prefixes from tool names (e.g. "default_api:tool__name").
+    """
 
-    return LLMUsage(
-        input_tokens=_int_or_none(getattr(metrics, "input_tokens", None)),
-        output_tokens=_int_or_none(getattr(metrics, "output_tokens", None)),
-        total_tokens=_int_or_none(getattr(metrics, "total_tokens", None)),
-        cache_creation_input_tokens=_int_or_none(getattr(metrics, "cache_write_tokens", None)),
-        cache_read_input_tokens=_int_or_none(getattr(metrics, "cache_read_tokens", None)),
-    )
-
-
-def _resolve_api_key(profile: Any) -> str | None:
-    cred = getattr(profile, "credential_ref", None)
-    if cred is None:
-        return None
-    kind = getattr(cred, "kind", None)
-    identifier = getattr(cred, "identifier", None)
-    if kind == "inline" and isinstance(identifier, str) and identifier.strip():
-        return identifier.strip()
-    return None
+    out: list[ToolCall] = []
+    for tc in tool_calls or []:
+        call_id = tc.tool_call_id
+        call_id = call_id.strip() if isinstance(call_id, str) and call_id.strip() else new_id("call")
+        name = tc.name.split(":", 1)[-1].strip()
+        out.append(
+            ToolCall(
+                tool_call_id=call_id,
+                name=name,
+                arguments=dict(tc.arguments),
+                raw_arguments=tc.raw_arguments,
+                thought_signature=tc.thought_signature,
+            )
+        )
+    return out
 
 
 @dataclass(slots=True)
@@ -142,6 +144,7 @@ class AgnoAsyncEngine:
     model_config: ModelConfig
     system_prompt: str | None = None
     tools_enabled: bool = False
+    llm_streaming: bool = True
     max_tool_turns: int = 30
     tool_registry: ToolRegistry | None = None
     tool_runtime: ToolRuntime | None = None
@@ -242,6 +245,12 @@ class AgnoAsyncEngine:
             last = 0
         self._event_sequence = last
 
+    def get_llm_streaming(self) -> bool:
+        return bool(self.llm_streaming)
+
+    def set_llm_streaming(self, enabled: bool) -> None:
+        self.llm_streaming = bool(enabled)
+
     def set_chat_model_profile(self, profile_id: str) -> None:
         if profile_id not in self.model_config.profiles:
             raise ValueError(f"Unknown model profile: {profile_id}")
@@ -314,6 +323,61 @@ class AgnoAsyncEngine:
                     )
 
         self._history = history
+
+    def _maybe_repair_interrupted_turn(self) -> dict[str, Any] | None:
+        """
+        Repair persisted history that ends mid-tool-turn.
+
+        This can happen if the process is interrupted (crash / Ctrl+C) after a tool executes but
+        before the model produces the follow-up assistant message. Some model providers reject
+        histories where the user speaks before the assistant finishes the tool turn.
+
+        Strategy: drop the last (user -> assistant tool_calls -> tool*) segment when we detect a
+        dangling tool turn at the end of the loaded history.
+        """
+        if not self._history:
+            return None
+
+        history = self._history
+
+        def _truncate_from_last_user(before_index: int) -> dict[str, Any] | None:
+            for i in range(before_index, -1, -1):
+                if history[i].role is CanonicalMessageRole.USER:
+                    removed = history[i:]
+                    removed_tool_names: list[str] = []
+                    for msg in removed:
+                        if msg.role is CanonicalMessageRole.ASSISTANT and msg.tool_calls:
+                            removed_tool_names.extend([tc.name for tc in msg.tool_calls if tc and tc.name])
+                        if msg.role is CanonicalMessageRole.TOOL and msg.tool_name:
+                            removed_tool_names.append(msg.tool_name)
+                    removed_tool_names = sorted({n for n in removed_tool_names if n})
+                    self._history = history[:i]
+                    return {
+                        "type": "history_repair",
+                        "reason": "dangling_tool_turn",
+                        "removed_messages": len(removed),
+                        "removed_tool_names": removed_tool_names,
+                    }
+            return None
+
+        # Case A: history ends with tool messages.
+        if history[-1].role is CanonicalMessageRole.TOOL:
+            first_tool_idx = len(history) - 1
+            while first_tool_idx > 0 and history[first_tool_idx - 1].role is CanonicalMessageRole.TOOL:
+                first_tool_idx -= 1
+            assistant_idx = first_tool_idx - 1
+            if (
+                assistant_idx >= 0
+                and history[assistant_idx].role is CanonicalMessageRole.ASSISTANT
+                and history[assistant_idx].tool_calls
+            ):
+                return _truncate_from_last_user(assistant_idx - 1)
+
+        # Case B: history ends with an assistant tool call (no tool response persisted yet).
+        if history[-1].role is CanonicalMessageRole.ASSISTANT and history[-1].tool_calls:
+            return _truncate_from_last_user(len(history) - 2)
+
+        return None
 
     def apply_memory_summary_retention(self) -> None:
         if self._history is None:
@@ -390,6 +454,20 @@ class AgnoAsyncEngine:
         )
         return RunResult(status="failed", run_id=op.request_id, session_id=self.session_id, error="unsupported_op")
 
+    def run(
+        self,
+        op: Op,
+        *,
+        timeout_s: float | None = None,
+        cancel: CancellationToken | None = None,
+    ) -> RunResult:
+        """
+        Synchronous wrapper used by the current CLI.
+
+        Async surfaces should call `await engine.arun(...)` directly.
+        """
+        return asyncio.run(self.arun(op, timeout_s=timeout_s, cancel=cancel))
+
     async def continue_run(
         self,
         *,
@@ -464,6 +542,7 @@ class AgnoAsyncEngine:
         if self._history is None:
             self._history = []
 
+        repair_info = self._maybe_repair_interrupted_turn()
         input_ref = self.artifact_store.put(user_text, kind="chat_user", meta={"summary": _summarize_text(user_text)})
         await self._emit(
             kind=EventKind.OPERATION_STARTED,
@@ -472,6 +551,14 @@ class AgnoAsyncEngine:
             turn_id=op.turn_id,
             step_id=None,
         )
+        if repair_info is not None:
+            await self._emit(
+                kind=EventKind.OPERATION_PROGRESS,
+                payload=repair_info,
+                request_id=op.request_id,
+                turn_id=op.turn_id,
+                step_id=None,
+            )
         self._history.append(CanonicalMessage(role=CanonicalMessageRole.USER, content=user_text))
 
         return await self._run_tool_loop(
@@ -682,6 +769,8 @@ class AgnoAsyncEngine:
 
             # Main model/tool loop.
             for _ in range(self.max_tool_turns):
+                caps = profile.capabilities.with_provider_defaults(profile.provider_kind)
+                use_stream = bool(self.llm_streaming and caps.supports_streaming is True)
                 step_id = new_id("step")
                 await self._emit(
                     kind=EventKind.LLM_REQUEST_STARTED,
@@ -690,58 +779,123 @@ class AgnoAsyncEngine:
                         "context_ref": self._write_context_ref(request).to_dict(),
                         "profile_id": getattr(profile, "profile_id", None),
                         "timeout_s": timeout_s if timeout_s is not None else getattr(profile, "timeout_s", None),
-                        "stream": False,
+                        "stream": use_stream,
                         "context_stats": dict(context_stats),
-                        "agno_mode": "agent_external_tools",
+                        "run_mode": "llm_tools",
                     },
                     request_id=request_id,
                     turn_id=turn_id,
                     step_id=step_id,
                 )
 
-                assistant_text, tool_calls = await self._run_agent_once(
-                    request=request,
-                    profile=profile,
-                    request_id=request_id,
-                    turn_id=turn_id,
-                    mcp_functions=mcp_functions,
-                )
+                try:
+                    if use_stream:
+                        resp = await self._run_agent_stream(
+                            request=request,
+                            profile=profile,
+                            request_id=request_id,
+                            turn_id=turn_id,
+                            step_id=step_id,
+                            timeout_s=timeout_s,
+                            cancel=cancel,
+                        )
+                    else:
+                        resp = await self._run_agent_once(
+                            request=request,
+                            profile=profile,
+                            request_id=request_id,
+                            turn_id=turn_id,
+                            timeout_s=timeout_s,
+                            cancel=cancel,
+                        )
+                except LLMRequestError as e:
+                    await self._emit(
+                        kind=EventKind.LLM_REQUEST_FAILED,
+                        payload={
+                            "role": ModelRole.MAIN.value,
+                            "error": str(e),
+                            "error_code": e.code.value,
+                            "retryable": bool(e.retryable),
+                            "status_code": e.status_code,
+                            "provider_kind": (e.provider_kind.value if e.provider_kind is not None else None),
+                            "profile_id": e.profile_id,
+                            "model": e.model,
+                            "request_id": e.request_id,
+                            "details": dict(e.details) if isinstance(e.details, dict) else None,
+                        },
+                        request_id=request_id,
+                        turn_id=turn_id,
+                        step_id=step_id,
+                    )
+                    await self._emit(
+                        kind=EventKind.OPERATION_FAILED,
+                        payload={
+                            "op_kind": OpKind.CHAT.value,
+                            "error": str(e),
+                            "error_code": e.code.value,
+                            "type": "llm_request",
+                        },
+                        request_id=request_id,
+                        turn_id=turn_id,
+                        step_id=None,
+                    )
+                    return RunResult(status="failed", run_id=request_id, session_id=self.session_id, error=e.code.value)
+                except Exception as e:
+                    await self._emit(
+                        kind=EventKind.LLM_REQUEST_FAILED,
+                        payload={
+                            "role": ModelRole.MAIN.value,
+                            "error": str(e),
+                            "error_code": ErrorCode.UNKNOWN.value,
+                            "retryable": False,
+                            "details": {"operation": "complete"},
+                        },
+                        request_id=request_id,
+                        turn_id=turn_id,
+                        step_id=step_id,
+                    )
+                    await self._emit(
+                        kind=EventKind.OPERATION_FAILED,
+                        payload={
+                            "op_kind": OpKind.CHAT.value,
+                            "error": str(e),
+                            "error_code": ErrorCode.UNKNOWN.value,
+                            "type": "llm_request",
+                        },
+                        request_id=request_id,
+                        turn_id=turn_id,
+                        step_id=None,
+                    )
+                    return RunResult(status="failed", run_id=request_id, session_id=self.session_id, error="llm_request_failed")
+                tool_calls = _normalize_tool_calls(resp.tool_calls)
+                normalized_resp = replace(resp, tool_calls=tool_calls)
 
                 planned_calls: list[PlannedToolCall] = []
                 if tool_calls:
                     for tc in tool_calls:
                         planned_calls.append(
                             self.tool_runtime.plan(
-                                tool_execution_id=f"tool_{tc.tool_call_id or new_id('call')}",
+                                tool_execution_id=f"tool_{tc.tool_call_id}",
                                 tool_name=tc.name,
-                                tool_call_id=str(tc.tool_call_id or new_id("call")),
+                                tool_call_id=str(tc.tool_call_id),
                                 arguments=dict(tc.arguments),
                             )
                         )
 
                 await self._emit_llm_response_completed(
-                    final_response=LLMResponse(
-                        provider_kind=profile.provider_kind,
-                        profile_id=profile.profile_id,
-                        model=profile.model_name,
-                        text=assistant_text,
-                        tool_calls=[],
-                        usage=None,
-                        stop_reason=None,
-                        request_id=None,
-                    ),
+                    final_response=normalized_resp,
                     planned_calls=planned_calls,
                     context_stats=context_stats,
                     request_id=request_id,
                     turn_id=turn_id,
                     step_id=step_id,
-                    extra_payload={"stream": False, "agno_mode": "agent_external_tools"},
+                    extra_payload={"stream": use_stream, "run_mode": "llm_tools"},
                 )
 
                 self._history.append(
                     CanonicalMessage(
                         role=CanonicalMessageRole.ASSISTANT,
-                        content=assistant_text,
+                        content=normalized_resp.text,
                         tool_calls=tool_calls or None,
                     )
                 )
@@ -922,7 +1076,7 @@ class AgnoAsyncEngine:
                 "profile_id": getattr(profile, "profile_id", None),
                 "timeout_s": timeout_s if timeout_s is not None else getattr(profile, "timeout_s", None),
                 "stream": False,
-                "agno_mode": "compact",
+                "run_mode": "llm_compact",
             },
             request_id=request_id,
             turn_id=turn_id,
@@ -931,12 +1085,13 @@ class AgnoAsyncEngine:
 
         try:
             # Compaction is a plain text completion (no tools).
-            summary_text, _tool_calls = await self._run_agent_once(
+            resp = await self._run_agent_once(
                 request=compact_request,
                 profile=profile,
                 request_id=request_id,
                 turn_id=turn_id,
-                mcp_functions={},
+                timeout_s=timeout_s,
+                cancel=cancel,
             )
         except Exception as e:
             await self._emit(
@@ -964,7 +1119,7 @@ class AgnoAsyncEngine:
             )
             return False
 
-        raw_summary = str(summary_text or "").strip()
+        raw_summary = str(resp.text or "").strip()
         if not raw_summary:
             raw_summary = "(empty summary)"
 
@@ -1051,110 +1206,147 @@ class AgnoAsyncEngine:
         self,
         *,
         request: CanonicalRequest,
-        profile: Any,
+        profile: ModelProfile,
         request_id: str,
         turn_id: str | None,
-        mcp_functions: dict[str, Any],
-    ) -> tuple[str, list[ToolCall]]:
-        try:
-            from agno.agent.agent import Agent as AgnoAgent
-            from agno.models.message import Message as AgnoMessage
-            from agno.tools.function import Function as AgnoFunction
-        except Exception as e:
-            raise RuntimeError(f"Agno is not available: {e}") from e
+        timeout_s: float | None,
+        cancel: CancellationToken | None,
+    ) -> LLMResponse:
+        """
+        Execute a single model request via Aura provider adapters (no agno.Agent).
 
-        agno_model = self._build_agno_model(profile)
+        The main engine owns canonical history, tool orchestration, approvals, and persistence.
+        Subagents remain agno.Agent-backed for isolation (see `aura/runtime/subagents/runner.py`).
+        """
+        trace = LLMTrace.maybe_create(
+            project_root=self.project_root,
+            session_id=self.session_id,
+            request_id=request_id,
+            turn_id=turn_id,
+            step_id=None,
+        )
+        if trace is not None:
+            trace.record_canonical_request(request)
 
-        input_messages: list[AgnoMessage] = []
-        if request.messages:
-            for msg in request.messages:
-                if msg.role is CanonicalMessageRole.SYSTEM:
-                    continue
-                if msg.role is CanonicalMessageRole.TOOL:
-                    input_messages.append(
-                        AgnoMessage(
-                            role="tool",
-                            content=msg.content,
-                            tool_call_id=msg.tool_call_id,
-                            tool_name=msg.tool_name,
-                        )
-                    )
-                    continue
-                if msg.role is CanonicalMessageRole.ASSISTANT and msg.tool_calls:
-                    tool_calls = []
-                    for tc in msg.tool_calls:
-                        if not (isinstance(tc.tool_call_id, str) and tc.tool_call_id.strip()):
-                            continue
-                        tool_calls.append(
-                            {
-                                "id": tc.tool_call_id,
-                                "type": "function",
-                                "function": {"name": tc.name, "arguments": json.dumps(tc.arguments, ensure_ascii=False)},
-                            }
-                        )
-                    input_messages.append(AgnoMessage(role="assistant", content=msg.content, tool_calls=tool_calls))
-                    continue
-                input_messages.append(AgnoMessage(role=msg.role.value, content=msg.content))
-
-        tools: list[AgnoFunction] = []
-        if self.tools_enabled and self.tool_registry is not None:
-            for spec in request.tools:
-                tools.append(
-                    AgnoFunction(
-                        name=spec.name,
-                        description=spec.description,
-                        parameters=spec.input_schema,
-                        external_execution=True,
-                    )
+        def _complete_sync() -> LLMResponse:
+            kind = profile.provider_kind
+            if kind is ProviderKind.OPENAI_COMPATIBLE:
+                return complete_openai_compatible(
+                    profile=profile,
+                    request=request,
+                    timeout_s=timeout_s,
+                    cancel=cancel,
+                    trace=trace,
                 )
-        for fn in mcp_functions.values():
+            if kind is ProviderKind.ANTHROPIC:
+                return complete_anthropic(
+                    profile=profile,
+                    request=request,
+                    timeout_s=timeout_s,
+                    cancel=cancel,
+                    trace=trace,
+                )
+            if kind is ProviderKind.GEMINI:
+                return complete_gemini(
+                    profile=profile,
+                    request=request,
+                    timeout_s=timeout_s,
+                    cancel=cancel,
+                    trace=trace,
+                )
+            raise RuntimeError(f"Unsupported provider_kind: {kind}")
+
+        return await asyncio.to_thread(_complete_sync)
+
+    async def _run_agent_stream(
+        self,
+        *,
+        request: CanonicalRequest,
+        profile: ModelProfile,
+        request_id: str,
+        turn_id: str | None,
+        step_id: str | None,
+        timeout_s: float | None,
+        cancel: CancellationToken | None,
+    ) -> LLMResponse:
+        """
+        Stream a single model request and forward deltas onto the EventBus.
+
+        Emits `llm_thinking_delta` and `llm_response_delta` events for live UI rendering, while
+        returning the final `LLMResponse` for normal tool-loop processing.
+        """
+        trace = LLMTrace.maybe_create(
+            project_root=self.project_root,
+            session_id=self.session_id,
+            request_id=request_id,
+            turn_id=turn_id,
+            step_id=None,
+        )
+        if trace is not None:
+            trace.record_canonical_request(request)
+
+        def _stream_sync() -> Any:
+            kind = profile.provider_kind
+            if kind is ProviderKind.OPENAI_COMPATIBLE:
+                return stream_openai_compatible(profile=profile, request=request, timeout_s=timeout_s, cancel=cancel, trace=trace)
+            if kind is ProviderKind.ANTHROPIC:
+                return stream_anthropic(profile=profile, request=request, timeout_s=timeout_s, cancel=cancel, trace=trace)
+            if kind is ProviderKind.GEMINI:
+                return stream_gemini(profile=profile, request=request, timeout_s=timeout_s, cancel=cancel, trace=trace)
+            raise RuntimeError(f"Unsupported provider_kind: {kind}")
+
+        loop = asyncio.get_running_loop()
+        q: asyncio.Queue[LLMStreamEvent | BaseException | None] = asyncio.Queue()
+
+        def _producer() -> None:
             try:
-                setattr(fn, "external_execution", True)
+                stream_iter = _stream_sync()
+                for ev in stream_iter:
+                    loop.call_soon_threadsafe(q.put_nowait, ev)
+                loop.call_soon_threadsafe(q.put_nowait, None)
+            except BaseException as e:
+                loop.call_soon_threadsafe(q.put_nowait, e)
+
+        threading.Thread(target=_producer, name="aura-llm-stream", daemon=True).start()
+
+        final: LLMResponse | None = None
+        while True:
+            item = await q.get()
+            if item is None:
+                break
+            if isinstance(item, BaseException):
+                raise item
+            ev = item
+            if ev.kind == LLMStreamEventKind.THINKING_DELTA:
+                if ev.thinking_delta:
+                    await self._emit(
+                        kind=EventKind.LLM_THINKING_DELTA,
+                        payload={"thinking_delta": ev.thinking_delta},
+                        request_id=request_id,
+                        turn_id=turn_id,
+                        step_id=step_id,
+                    )
+            elif ev.kind == LLMStreamEventKind.TEXT_DELTA:
+                if ev.text_delta:
+                    await self._emit(
+                        kind=EventKind.LLM_RESPONSE_DELTA,
+                        payload={"text_delta": ev.text_delta},
+                        request_id=request_id,
+                        turn_id=turn_id,
+                        step_id=step_id,
+                    )
+            elif ev.kind == LLMStreamEventKind.COMPLETED:
+                if ev.response is not None:
+                    final = ev.response
+
+        if final is None:
+            raise RuntimeError("Stream ended without a terminal response.")
+        if trace is not None:
+            try:
+                trace.record_response(final)
             except Exception:
                 pass
-            tools.append(fn)
-
-        agent = AgnoAgent(
-            name="Aura",
-            model=agno_model,
-            system_message=request.system or "",
-            db=None,
-            tools=tools,
-            stream=False,
-            stream_events=False,
-        )
-
-        metadata = {"aura_request_id": request_id, "aura_turn_id": turn_id}
-        out = await agent.arun(
-            input_messages,
-            stream=False,
-            session_id=self.session_id,
-            run_id=request_id,
-            metadata=metadata,
-            add_history_to_context=False,
-        )
-
-        assistant_text = ""
-        content = getattr(out, "content", None)
-        if isinstance(content, str):
-            assistant_text = content
-        elif content is not None:
-            assistant_text = str(content)
-
-        tool_calls: list[ToolCall] = []
-        for te in getattr(out, "tools", []) or []:
-            if not getattr(te, "external_execution_required", False):
-                continue
-            tcid = getattr(te, "tool_call_id", None)
-            name = getattr(te, "tool_name", None)
-            args = getattr(te, "tool_args", None)
-            if not isinstance(tcid, str) or not tcid or not isinstance(name, str) or not name:
-                continue
-            if not isinstance(args, dict):
-                args = {}
-            tool_calls.append(ToolCall(tool_call_id=tcid, name=name, arguments=dict(args), raw_arguments=None))
-
-        return assistant_text, tool_calls
+        return final
 
     def _build_request(self, *, extra_tools: list[ToolSpec] | None = None) -> CanonicalRequest:
         tools: list[ToolSpec] = []
@@ -1481,26 +1673,53 @@ class AgnoAsyncEngine:
             kind="chat_assistant",
             meta={"summary": _summarize_text(assistant_text)},
         )
+        thought_signatures: dict[str, str] = {}
+        for tc in final_response.tool_calls or []:
+            tcid = tc.tool_call_id
+            sig = tc.thought_signature
+            if isinstance(tcid, str) and tcid.strip() and isinstance(sig, str) and sig.strip():
+                thought_signatures[tcid.strip()] = sig.strip()
+        tool_calls_payload: list[dict[str, Any]] = []
+        for p in planned_calls:
+            item: dict[str, Any] = {
+                "tool_execution_id": p.tool_execution_id,
+                "tool_name": p.tool_name,
+                "tool_call_id": p.tool_call_id,
+                "arguments_ref": p.arguments_ref.to_dict(),
+            }
+            sig = thought_signatures.get(p.tool_call_id)
+            if isinstance(sig, str) and sig:
+                item["thought_signature"] = sig
+            tool_calls_payload.append(item)
         payload: dict[str, Any] = {
             "profile_id": final_response.profile_id,
             "provider_kind": final_response.provider_kind.value,
             "model": final_response.model,
             "output_ref": output_ref.to_dict(),
-            "tool_calls": [
-                {
-                    "tool_execution_id": p.tool_execution_id,
-                    "tool_name": p.tool_name,
-                    "tool_call_id": p.tool_call_id,
-                    "arguments_ref": p.arguments_ref.to_dict(),
-                }
-                for p in planned_calls
-            ],
+            "tool_calls": tool_calls_payload,
             "usage": usage,
             "context_stats": merged_stats,
             "stop_reason": final_response.stop_reason,
         }
         if isinstance(extra_payload, dict):
             payload.update(extra_payload)
+
+        # Non-streaming providers still need to emit deltas for the console UI, which renders
+        # assistant text from LLM_RESPONSE_DELTA events (and uses LLM_RESPONSE_COMPLETED as a terminal marker).
+        # When streaming is enabled, deltas are emitted incrementally elsewhere and we avoid duplication.
+        emit_delta = True
+        if isinstance(extra_payload, dict) and extra_payload.get("stream") is True:
+            emit_delta = False
+        if emit_delta and isinstance(assistant_text, str) and assistant_text:
+            chunk_size = 2048
+            for i in range(0, len(assistant_text), chunk_size):
+                await self._emit(
+                    kind=EventKind.LLM_RESPONSE_DELTA,
+                    payload={"text_delta": assistant_text[i : i + chunk_size]},
+                    request_id=request_id,
+                    turn_id=turn_id,
+                    step_id=step_id,
+                )
 
         await self._emit(
             kind=EventKind.LLM_RESPONSE_COMPLETED,
@@ -1797,34 +2016,5 @@ class AgnoAsyncEngine:
                 pass
             return event
 
-    def _build_agno_model(self, profile: Any) -> Any:
-        provider_kind = getattr(profile, "provider_kind", None)
-        model_name = getattr(profile, "model_name", None)
-        base_url = getattr(profile, "base_url", None)
-        timeout_s = getattr(profile, "timeout_s", None)
-        if model_name is None or not isinstance(model_name, str) or not model_name.strip():
-            raise ValueError("Selected model profile is missing model_name.")
-
-        kind_value = getattr(provider_kind, "value", provider_kind)
-
-        if kind_value == "openai_compatible":
-            from agno.models.openai.like import OpenAILike
-
-            api_key = _resolve_api_key(profile)
-            kwargs: dict[str, Any] = {"id": model_name.strip(), "api_key": api_key}
-            if isinstance(base_url, str) and base_url.strip():
-                kwargs["base_url"] = base_url.strip()
-            if isinstance(timeout_s, (int, float)) and not isinstance(timeout_s, bool) and float(timeout_s) > 0:
-                kwargs["timeout"] = float(timeout_s)
-            return OpenAILike(**kwargs)
-
-        if kind_value == "anthropic":
-            from agno.models.anthropic.claude import Claude
-
-            api_key = _resolve_api_key(profile)
-            kwargs = {"id": model_name.strip(), "api_key": api_key}
-            if isinstance(timeout_s, (int, float)) and not isinstance(timeout_s, bool) and float(timeout_s) > 0:
-                kwargs["timeout"] = float(timeout_s)
-            return Claude(**kwargs)
-
-        raise RuntimeError(f"Unsupported provider_kind for agno engine: {kind_value!r}")
+    # Agno-backed execution is still used by subagents (see `aura/runtime/subagents/runner.py`),
+    # but the main engine LLM path calls Aura's provider adapters directly.

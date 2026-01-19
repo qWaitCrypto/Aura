@@ -8,7 +8,7 @@ from typing import Any
 class ProviderKind(StrEnum):
     OPENAI_COMPATIBLE = "openai_compatible"
     ANTHROPIC = "anthropic"
-    GEMINI_INTERNAL = "gemini_internal"
+    GEMINI = "gemini"
 
 
 class ModelRole(StrEnum):
@@ -59,15 +59,11 @@ class ModelCapabilities:
     def with_provider_defaults(self, provider_kind: ProviderKind) -> "ModelCapabilities":
         supports_streaming = self.supports_streaming
         if supports_streaming is None:
-            if provider_kind in (ProviderKind.OPENAI_COMPATIBLE, ProviderKind.ANTHROPIC):
+            if provider_kind in (ProviderKind.OPENAI_COMPATIBLE, ProviderKind.ANTHROPIC, ProviderKind.GEMINI):
                 supports_streaming = True
-            elif provider_kind is ProviderKind.GEMINI_INTERNAL:
-                supports_streaming = False
         supports_tools = self.supports_tools
         if supports_tools is None:
-            if provider_kind in (ProviderKind.OPENAI_COMPATIBLE, ProviderKind.ANTHROPIC):
-                supports_tools = True
-            elif provider_kind is ProviderKind.GEMINI_INTERNAL:
+            if provider_kind in (ProviderKind.OPENAI_COMPATIBLE, ProviderKind.ANTHROPIC, ProviderKind.GEMINI):
                 supports_tools = True
         return ModelCapabilities(
             supports_tools=supports_tools,
