@@ -89,6 +89,46 @@ See `aura/runtime/surface.py` for the interface.
 
 ---
 
+## Architecture Overview
+
+This diagram highlights Aura’s core flow: **runtime engine + multi-surface entrypoints + auditable toolchain + project state storage**. It maps both the repository layout and the `.aura/` workspace layout to make module boundaries and data paths easy to locate.
+
+```mermaid
+flowchart TD
+    User((Developer)) --> CLI[aura/cli.py]
+    User --> Web[Future Web UI]
+    User --> Plugin[IDE Plugin]
+
+    CLI --> Surface[surfaces/*]
+    Web --> Surface
+    Plugin --> Surface
+
+    Surface --> Engine[aura/runtime/engine_agno_async.py]
+
+    Engine --> Tools[aura/runtime/tools/*]
+    Engine --> Skills[aura/runtime/skills.py]
+    Engine --> Subagents[aura/runtime/subagents/*]
+    Engine --> MCP[aura/runtime/mcp/*]
+    Engine --> Knowledge[aura/runtime/knowledge/*]
+    Engine --> Approval[Approval Policies]
+
+    Tools --> FS[File/Shell/Web tools]
+    Tools --> Spec[Spec/Skill tools]
+
+    Approval --> Events[.aura/events/*.jsonl]
+    Engine --> Sessions[.aura/sessions/*.json]
+    Engine --> Runs[.aura/runs/*]
+    Skills --> SkillStore[.aura/skills/*]
+    Knowledge --> KB[.aura/knowledge/*]
+    Knowledge --> VectorDB[.aura/vectordb/*]
+    MCP --> MCPConfig[.aura/config/mcp.json]
+
+    Events --> Audit[Append-only audit trail]
+    Sessions --> Replay[Session replay & compaction]
+```
+
+---
+
 ## Directory Structure
 
 ### Your Workspace (created by `aura init`)
