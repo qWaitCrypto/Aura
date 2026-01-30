@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 from typing import Any
+import tomllib
 
 from .config import ModelConfig, ModelConfigLayers
 from .errors import ModelConfigError
@@ -183,14 +184,41 @@ def _parse_registry_profile(profile_id: str, profile_dict: dict[str, Any], *, so
     api_key_val = profile_dict.get("api_key")
     api_key = api_key_val if isinstance(api_key_val, str) else None
     api_key = api_key.strip() if isinstance(api_key, str) else None
+
+    if (
+        provider_kind is ProviderKind.OPENAI_CODEX
+        and api_key
+        and not api_key.startswith("codex-cli")
+        and "/backend-api/codex" not in base_url
+        and model_name.endswith("-codex")
+    ):
+        # Common misconfiguration: using a Codex-suffixed model name with a non-Codex OAuth token.
+        # For OpenAI-compatible Responses endpoints, the unsuffixed model name is usually required.
+        model_name = model_name[: -len("-codex")]
+
+    if provider_kind is ProviderKind.OPENAI_CODEX and api_key == "codex-cli" and _should_apply_codex_cli_model_migrations():
+        migrated = _codex_cli_model_migrations().get(model_name)
+        if isinstance(migrated, str) and migrated.strip():
+            model_name = migrated.strip()
+
     if api_key:
-        credential_ref = CredentialRef(kind="inline", identifier=api_key)
+        if provider_kind is ProviderKind.OPENAI_CODEX and api_key.startswith("codex-cli"):
+            # "codex-cli" means: reuse CODEX_HOME/auth.json (or ~/.codex/auth.json).
+            # "codex-cli:/path/to/auth.json" can override the path.
+            identifier = ""
+            if api_key.startswith("codex-cli:"):
+                identifier = api_key[len("codex-cli:") :].strip()
+            credential_ref = CredentialRef(kind="codex_cli", identifier=identifier)
+        else:
+            credential_ref = CredentialRef(kind="inline", identifier=api_key)
     elif provider_kind is ProviderKind.OPENAI_COMPATIBLE:
         # OpenAI-compatible endpoints are often local/proxied and may not require authentication.
         # The OpenAI SDK still expects an api_key, so default to a dummy key if none is provided.
         credential_ref = CredentialRef(kind="inline", identifier="aura")
     else:
         credential_ref = None
+        if provider_kind is ProviderKind.OPENAI_CODEX:
+            raise ModelConfigError(f"{source}:profiles.{profile_id}: api_key is required for provider_kind=openai_codex")
         if provider_kind is ProviderKind.ANTHROPIC:
             raise ModelConfigError(f"{source}:profiles.{profile_id}: api_key is required for provider_kind=anthropic")
         if provider_kind is ProviderKind.GEMINI:
@@ -790,3 +818,46 @@ def _assert_known_keys(obj: dict[str, Any], *, allowed: set[str], ctx: str) -> N
     if unknown:
         rendered = ", ".join(sorted(unknown))
         raise ModelConfigError(f"{ctx} contains unknown keys: {rendered}")
+
+
+_CACHED_CODEX_CLI_MODEL_MIGRATIONS: dict[str, str] | None = None
+
+
+def _should_apply_codex_cli_model_migrations() -> bool:
+    return os.environ.get("AURA_CODEX_CLI_APPLY_MODEL_MIGRATIONS") == "1"
+
+
+def _codex_cli_model_migrations() -> dict[str, str]:
+    global _CACHED_CODEX_CLI_MODEL_MIGRATIONS
+    if _CACHED_CODEX_CLI_MODEL_MIGRATIONS is not None:
+        return _CACHED_CODEX_CLI_MODEL_MIGRATIONS
+
+    codex_home = os.environ.get("CODEX_HOME")
+    config_path = (Path(codex_home) / "config.toml") if codex_home else (Path.home() / ".codex" / "config.toml")
+    try:
+        raw = config_path.read_bytes()
+    except FileNotFoundError:
+        _CACHED_CODEX_CLI_MODEL_MIGRATIONS = {}
+        return _CACHED_CODEX_CLI_MODEL_MIGRATIONS
+
+    try:
+        data = tomllib.loads(raw.decode("utf-8"))
+    except Exception:
+        _CACHED_CODEX_CLI_MODEL_MIGRATIONS = {}
+        return _CACHED_CODEX_CLI_MODEL_MIGRATIONS
+
+    notice = data.get("notice")
+    if not isinstance(notice, dict):
+        _CACHED_CODEX_CLI_MODEL_MIGRATIONS = {}
+        return _CACHED_CODEX_CLI_MODEL_MIGRATIONS
+    migrations = notice.get("model_migrations")
+    if not isinstance(migrations, dict):
+        _CACHED_CODEX_CLI_MODEL_MIGRATIONS = {}
+        return _CACHED_CODEX_CLI_MODEL_MIGRATIONS
+
+    out: dict[str, str] = {}
+    for k, v in migrations.items():
+        if isinstance(k, str) and isinstance(v, str) and k.strip() and v.strip():
+            out[k.strip()] = v.strip()
+    _CACHED_CODEX_CLI_MODEL_MIGRATIONS = out
+    return out

@@ -99,6 +99,38 @@ def _summarize_tool_for_ui(tool_name: str, arguments: dict[str, Any]) -> str:
             return f"Run $ {one_line}"
         return "Run shell command"
 
+    if tool_name == "subagent__run":
+        preset = arguments.get("preset")
+        task = arguments.get("task")
+        task_snippet = _summarize_text(task, max_len=80) if isinstance(task, str) and task.strip() else None
+
+        if isinstance(preset, str) and preset.strip():
+            head = f"Subagent: {preset.strip()}"
+        else:
+            head = "Subagent run"
+        if task_snippet:
+            return f"{head} — {task_snippet}"
+        return head
+
+    if tool_name == "browser__run":
+        steps = arguments.get("steps")
+        if isinstance(steps, list) and steps:
+            first = steps[0]
+            if isinstance(first, str) and first.strip():
+                head = first.strip()
+            elif isinstance(first, list) and first and all(isinstance(x, str) for x in first):
+                head = " ".join(x for x in first if x)
+            elif isinstance(first, dict):
+                cmd = first.get("command")
+                head = str(cmd).strip() if isinstance(cmd, str) and cmd.strip() else "step"
+            else:
+                head = "step"
+            suffix = ""
+            if len(steps) > 1:
+                suffix = f" (+{len(steps) - 1} step(s))"
+            return f"Browser: {head}{suffix}"
+        return "Browser automation"
+
     if tool_name == "web__fetch":
         url = arguments.get("url")
         if isinstance(url, str) and url:
@@ -144,6 +176,8 @@ def _summarize_tool_for_ui(tool_name: str, arguments: dict[str, Any]) -> str:
 
     if tool_name == "update_plan":
         return "Update plan"
+    if tool_name == "update_todo":
+        return "Update todo"
 
     if tool_name.startswith("skill__"):
         name = arguments.get("name")

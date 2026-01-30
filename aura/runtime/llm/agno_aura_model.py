@@ -8,6 +8,7 @@ from typing import Any, Dict, Iterator, List, Optional, Type, Union
 from pydantic import BaseModel
 
 from .client_exec_anthropic import complete_anthropic
+from .client_exec_openai_codex import complete_openai_codex
 from .client_exec_gemini import complete_gemini
 from .client_exec_openai_compatible import complete_openai_compatible
 from .errors import LLMRequestError, ProviderAdapterError
@@ -323,6 +324,14 @@ class AuraAgnoModel(Model):
             kind = self.profile.provider_kind
             if kind is ProviderKind.OPENAI_COMPATIBLE:
                 return complete_openai_compatible(
+                    profile=self.profile,
+                    request=canonical,
+                    timeout_s=self.profile.timeout_s,
+                    cancel=None,
+                    trace=trace,
+                )
+            if kind is ProviderKind.OPENAI_CODEX:
+                return complete_openai_codex(
                     profile=self.profile,
                     request=canonical,
                     timeout_s=self.profile.timeout_s,

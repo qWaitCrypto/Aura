@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import importlib.resources
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 
@@ -25,12 +25,102 @@ class SubagentPreset:
     prompt_asset: str
     default_allowlist: list[str]
     limits: SubagentLimits
+    safe_shell_prefixes: list[str] = field(default_factory=list)
+    auto_approve_tools: list[str] = field(default_factory=list)
 
     def load_prompt(self) -> str:
         return load_prompt_asset(self.prompt_asset)
 
 
 _PRESETS: dict[str, SubagentPreset] = {
+    "file_ops_worker": SubagentPreset(
+        name="file_ops_worker",
+        prompt_asset="subagent_file_ops_worker.md",
+        default_allowlist=[
+            "project__list_dir",
+            "project__glob",
+            "project__read_text",
+            "project__read_text_many",
+            "project__apply_edits",
+            "shell__run",
+            "snapshot__create",
+            "snapshot__diff",
+        ],
+        limits=SubagentLimits(max_turns=12, max_tool_calls=24),
+    ),
+    "doc_worker": SubagentPreset(
+        name="doc_worker",
+        prompt_asset="subagent_doc_worker.md",
+        default_allowlist=[
+            # Skills (docx/pdf)
+            "skill__list",
+            "skill__load",
+            "skill__read_file",
+
+            # Project IO
+            "project__list_dir",
+            "project__glob",
+            "project__read_text",
+            "project__read_text_many",
+            "project__apply_edits",
+            "project__search_text",
+
+            # Execute skill scripts (approval-gated via ToolRuntime + approval agent)
+            "shell__run",
+
+            "snapshot__create",
+            "snapshot__diff",
+        ],
+        limits=SubagentLimits(max_turns=12, max_tool_calls=24),
+        # Auto-approve running the *skill runner* script (see subagents/runner.py safety checks).
+        safe_shell_prefixes=[
+            ".aura/skills/aura-docx/scripts/run.py",
+            ".aura/skills/aura-pdf/scripts/run.py",
+        ],
+    ),
+    "sheet_worker": SubagentPreset(
+        name="sheet_worker",
+        prompt_asset="subagent_sheet_worker.md",
+        default_allowlist=[
+            # Skills (xlsx)
+            "skill__list",
+            "skill__load",
+            "skill__read_file",
+
+            # Project IO
+            "project__list_dir",
+            "project__glob",
+            "project__read_text",
+            "project__read_text_many",
+            "project__apply_edits",
+            "project__search_text",
+
+            # Execute skill scripts (approval-gated via ToolRuntime + approval agent)
+            "shell__run",
+
+            "snapshot__create",
+            "snapshot__diff",
+        ],
+        limits=SubagentLimits(max_turns=12, max_tool_calls=24),
+        # Auto-approve running the *skill runner* script (see subagents/runner.py safety checks).
+        safe_shell_prefixes=[
+            ".aura/skills/aura-xlsx/scripts/run.py",
+        ],
+    ),
+    "browser_worker": SubagentPreset(
+        name="browser_worker",
+        prompt_asset="subagent_browser_worker.md",
+        default_allowlist=[
+            "skill__list",
+            "skill__load",
+            "skill__read_file",
+            "browser__run",
+        ],
+        limits=SubagentLimits(max_turns=20, max_tool_calls=50),
+        safe_shell_prefixes=[],
+        # Testing mode: allow browser automation without approval prompts.
+        auto_approve_tools=["browser__run"],
+    ),
     "verifier": SubagentPreset(
         name="verifier",
         prompt_asset="subagent_verifier.md",
@@ -40,34 +130,14 @@ _PRESETS: dict[str, SubagentPreset] = {
             "project__read_text",
             "project__read_text_many",
             "project__search_text",
+            "snapshot__list",
             "spec__query",
             "spec__get",
             "snapshot__read_text",
+            "snapshot__diff",
             "session__search",
         ],
         limits=SubagentLimits(max_turns=6, max_tool_calls=12),
-    ),
-    "tool_interpreter": SubagentPreset(
-        name="tool_interpreter",
-        prompt_asset="subagent_tool_interpreter.md",
-        default_allowlist=[
-            "project__list_dir",
-            "project__glob",
-            "project__read_text",
-            "project__read_text_many",
-            "project__search_text",
-            "project__apply_edits",
-            "project__text_stats",
-            "spec__query",
-            "spec__get",
-            "spec__propose",
-            "snapshot__list",
-            "snapshot__create",
-            "snapshot__diff",
-            "snapshot__read_text",
-            "session__search",
-        ],
-        limits=SubagentLimits(max_turns=12, max_tool_calls=24),
     ),
 }
 
@@ -86,4 +156,3 @@ def preset_input_schema() -> dict[str, Any]:
         "enum": list_presets(),
         "description": "Subagent preset.",
     }
-

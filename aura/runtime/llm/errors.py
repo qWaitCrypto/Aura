@@ -5,9 +5,6 @@ import threading
 from enum import StrEnum
 from typing import Any
 
-import anthropic
-import openai
-
 from ..error_codes import ErrorCode
 from .types import ProviderKind
 
@@ -94,28 +91,56 @@ def classify_provider_exception(exc: BaseException) -> LLMErrorCode:
     if isinstance(exc, LLMRequestError):
         return exc.code
 
-    if isinstance(exc, (openai.APITimeoutError, anthropic.APITimeoutError)):
-        return LLMErrorCode.TIMEOUT
-    if isinstance(exc, (openai.APIConnectionError, anthropic.APIConnectionError)):
-        return LLMErrorCode.NETWORK_ERROR
-    if isinstance(exc, (openai.RateLimitError, anthropic.RateLimitError)):
-        return LLMErrorCode.RATE_LIMIT
-    if isinstance(exc, (openai.AuthenticationError, anthropic.AuthenticationError)):
-        return LLMErrorCode.AUTH
-    if isinstance(exc, (openai.PermissionDeniedError, anthropic.PermissionDeniedError)):
-        return LLMErrorCode.PERMISSION
-    if isinstance(exc, (openai.NotFoundError, anthropic.NotFoundError)):
-        return LLMErrorCode.NOT_FOUND
-    if isinstance(exc, (openai.ConflictError, anthropic.ConflictError)):
-        return LLMErrorCode.CONFLICT
-    if isinstance(exc, (openai.UnprocessableEntityError, anthropic.UnprocessableEntityError)):
-        return LLMErrorCode.UNPROCESSABLE
-    if isinstance(exc, (openai.BadRequestError, anthropic.BadRequestError)):
-        return LLMErrorCode.BAD_REQUEST
-    if isinstance(exc, (openai.InternalServerError, anthropic.InternalServerError)):
-        return LLMErrorCode.SERVER_ERROR
-    if isinstance(exc, (openai.APIResponseValidationError, anthropic.APIResponseValidationError)):
-        return LLMErrorCode.RESPONSE_VALIDATION
+    openai = _maybe_import_openai()
+    anthropic = _maybe_import_anthropic()
+
+    if openai is not None:
+        if isinstance(exc, openai.APITimeoutError):
+            return LLMErrorCode.TIMEOUT
+        if isinstance(exc, openai.APIConnectionError):
+            return LLMErrorCode.NETWORK_ERROR
+        if isinstance(exc, openai.RateLimitError):
+            return LLMErrorCode.RATE_LIMIT
+        if isinstance(exc, openai.AuthenticationError):
+            return LLMErrorCode.AUTH
+        if isinstance(exc, openai.PermissionDeniedError):
+            return LLMErrorCode.PERMISSION
+        if isinstance(exc, openai.NotFoundError):
+            return LLMErrorCode.NOT_FOUND
+        if isinstance(exc, openai.ConflictError):
+            return LLMErrorCode.CONFLICT
+        if isinstance(exc, openai.UnprocessableEntityError):
+            return LLMErrorCode.UNPROCESSABLE
+        if isinstance(exc, openai.BadRequestError):
+            return LLMErrorCode.BAD_REQUEST
+        if isinstance(exc, openai.InternalServerError):
+            return LLMErrorCode.SERVER_ERROR
+        if isinstance(exc, openai.APIResponseValidationError):
+            return LLMErrorCode.RESPONSE_VALIDATION
+
+    if anthropic is not None:
+        if isinstance(exc, anthropic.APITimeoutError):
+            return LLMErrorCode.TIMEOUT
+        if isinstance(exc, anthropic.APIConnectionError):
+            return LLMErrorCode.NETWORK_ERROR
+        if isinstance(exc, anthropic.RateLimitError):
+            return LLMErrorCode.RATE_LIMIT
+        if isinstance(exc, anthropic.AuthenticationError):
+            return LLMErrorCode.AUTH
+        if isinstance(exc, anthropic.PermissionDeniedError):
+            return LLMErrorCode.PERMISSION
+        if isinstance(exc, anthropic.NotFoundError):
+            return LLMErrorCode.NOT_FOUND
+        if isinstance(exc, anthropic.ConflictError):
+            return LLMErrorCode.CONFLICT
+        if isinstance(exc, anthropic.UnprocessableEntityError):
+            return LLMErrorCode.UNPROCESSABLE
+        if isinstance(exc, anthropic.BadRequestError):
+            return LLMErrorCode.BAD_REQUEST
+        if isinstance(exc, anthropic.InternalServerError):
+            return LLMErrorCode.SERVER_ERROR
+        if isinstance(exc, anthropic.APIResponseValidationError):
+            return LLMErrorCode.RESPONSE_VALIDATION
 
     status_code = getattr(exc, "status_code", None)
     if isinstance(status_code, int):
@@ -173,8 +198,11 @@ def wrap_provider_exception(
 
 
 def _provider_error_detail(exc: BaseException) -> str | None:
+    openai = _maybe_import_openai()
+    anthropic = _maybe_import_anthropic()
+
     # OpenAI SDK HTTP errors often include a structured body with the real error message.
-    if isinstance(exc, openai.OpenAIError):
+    if openai is not None and isinstance(exc, openai.OpenAIError):
         body = getattr(exc, "body", None)
         if isinstance(body, dict):
             err = body.get("error")
@@ -204,7 +232,7 @@ def _provider_error_detail(exc: BaseException) -> str | None:
         return None
 
     # Anthropic SDK errors may also carry response information; keep best-effort.
-    if isinstance(exc, anthropic.AnthropicError):
+    if anthropic is not None and isinstance(exc, anthropic.AnthropicError):
         body = getattr(exc, "body", None)
         if isinstance(body, dict):
             msg = body.get("message")
@@ -231,3 +259,21 @@ def _truncate(text: str, max_chars: int) -> str:
     if len(text) <= max_chars:
         return text
     return text[: max(0, max_chars - 1)] + "…"
+
+
+def _maybe_import_openai():
+    try:
+        import openai  # type: ignore
+
+        return openai
+    except Exception:
+        return None
+
+
+def _maybe_import_anthropic():
+    try:
+        import anthropic  # type: ignore
+
+        return anthropic
+    except Exception:
+        return None

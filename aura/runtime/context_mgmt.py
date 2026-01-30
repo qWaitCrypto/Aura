@@ -53,6 +53,8 @@ def canonical_message_to_dict(msg: CanonicalMessage) -> dict[str, Any]:
             {"tool_call_id": tc.tool_call_id, "name": tc.name, "arguments": tc.arguments}
             for tc in msg.tool_calls
         ]
+    if msg.reasoning_content is not None:
+        out["reasoning_content"] = msg.reasoning_content
     return out
 
 
@@ -131,6 +133,7 @@ def select_recent_messages_to_fit_budget(
                 tool_call_id=msg.tool_call_id,
                 tool_name=msg.tool_name,
                 tool_calls=msg.tool_calls,
+                reasoning_content=msg.reasoning_content,
             )
             kept.append(truncated)
         break
@@ -143,6 +146,18 @@ def strip_tool_output_for_compaction(
     if msg.role is not CanonicalMessageRole.TOOL:
         return msg
     if tool_output_budget_tokens <= 0:
-        return CanonicalMessage(role=msg.role, content="", tool_call_id=msg.tool_call_id, tool_name=msg.tool_name)
+        return CanonicalMessage(
+            role=msg.role,
+            content="",
+            tool_call_id=msg.tool_call_id,
+            tool_name=msg.tool_name,
+            reasoning_content=msg.reasoning_content,
+        )
     content = truncate_text_to_budget(msg.content, budget_tokens=tool_output_budget_tokens)
-    return CanonicalMessage(role=msg.role, content=content, tool_call_id=msg.tool_call_id, tool_name=msg.tool_name)
+    return CanonicalMessage(
+        role=msg.role,
+        content=content,
+        tool_call_id=msg.tool_call_id,
+        tool_name=msg.tool_name,
+        reasoning_content=msg.reasoning_content,
+    )

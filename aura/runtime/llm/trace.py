@@ -188,6 +188,7 @@ class LLMTrace:
                         "content": m.content,
                         "tool_call_id": m.tool_call_id,
                         "tool_name": m.tool_name,
+                        "reasoning_content": m.reasoning_content,
                         "tool_calls": (
                             [
                                 {
