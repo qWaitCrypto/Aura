@@ -1,17 +1,25 @@
 from __future__ import annotations
 
+import ipaddress
 import json
+import shlex
+from contextlib import contextmanager
+from contextvars import ContextVar, Token
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from ..event_bus import EventBus
 
 from ..protocol import ArtifactRef
 from ..error_codes import ErrorCode
+from ..models import WorkSpec
 
 from ..stores import ArtifactStore
+from .builtins import _resolve_in_project
+from .browser_steps import parse_browser_steps
 from .registry import ToolRegistry
 
 
@@ -155,6 +163,79 @@ def _summarize_shell_run_args(args: dict[str, Any], *, max_chars: int = 120) -> 
     return f"Run $ {one_line}"
 
 
+def _browser_step_is_high_risk(step: list[str]) -> bool:
+    if not step:
+        return True
+
+    cmd = step[0]
+    if cmd == "search":
+        # `agent-browser search <query>` is a convenience wrapper around normal browsing.
+        return False
+    if cmd == "open":
+        # Allow normal web browsing without approval; gate local/insecure schemes.
+        url = next((t for t in step[1:] if isinstance(t, str) and "://" in t), None)
+        if isinstance(url, str):
+            parsed = urlparse(url)
+            if parsed.scheme not in {"http", "https"}:
+                return True
+            host = parsed.hostname
+            if isinstance(host, str) and host:
+                host_l = host.lower()
+                if host_l in {"localhost"} or host_l.endswith(".local"):
+                    return True
+                try:
+                    ip = ipaddress.ip_address(host_l.strip("[]"))
+                    if ip.is_loopback or ip.is_private or ip.is_link_local:
+                        return True
+                except ValueError:
+                    pass
+        return False
+
+    if cmd in {"back", "forward", "reload", "close", "snapshot", "get", "wait", "scroll", "scrollintoview", "hover", "is"}:
+        return False
+
+    # Lightweight interactions (still considered low-risk browsing).
+    if cmd in {"click", "dblclick", "focus", "press", "fill", "type", "select", "check", "uncheck", "keydown", "keyup"}:
+        return False
+
+    if cmd == "screenshot":
+        # `agent-browser screenshot` is safe. When writing to a path, treat as higher risk.
+        non_flags = [a for a in step[1:] if isinstance(a, str) and a and not a.startswith("-")]
+        return len(non_flags) > 0
+
+    if cmd == "find":
+        # `find` can embed an action word; only gate operations that are clearly higher-risk.
+        if any(tok == "upload" for tok in step[1:] if isinstance(tok, str)):
+            return True
+        return False
+
+    if cmd in {"tab", "window", "frame", "mouse"}:
+        return False
+
+    if cmd in {"pdf", "record", "upload", "eval", "drag"}:
+        return True
+
+    if cmd == "cookies":
+        return True
+
+    if cmd == "storage":
+        return True
+
+    if cmd == "network":
+        return True
+
+    if cmd == "set":
+        if len(step) >= 2 and step[1] in {"headers", "credentials"}:
+            return True
+        return False
+
+    if cmd == "dialog":
+        return True
+
+    # Default: unknown browser operation, require approval.
+    return True
+
+
 class InspectionDecision(StrEnum):
     ALLOW = "allow"
     DENY = "deny"
@@ -223,6 +304,7 @@ class ToolRuntime:
         self._registry = registry
         self._artifact_store = artifact_store
         self._approval_mode = approval_mode
+        self._work_spec_var: ContextVar[WorkSpec | None] = ContextVar("aura_work_spec", default=None)
 
     def set_approval_mode(self, mode: ToolApprovalMode) -> None:
         self._approval_mode = mode
@@ -240,6 +322,17 @@ class ToolRuntime:
 
     def get_tool(self, tool_name: str):
         return self._registry.get(tool_name)
+
+    def get_work_spec(self) -> WorkSpec | None:
+        return self._work_spec_var.get()
+
+    @contextmanager
+    def work_spec_context(self, work_spec: WorkSpec | None):
+        token: Token[WorkSpec | None] = self._work_spec_var.set(work_spec)
+        try:
+            yield
+        finally:
+            self._work_spec_var.reset(token)
 
     def plan(self, *, tool_execution_id: str, tool_name: str, tool_call_id: str, arguments: dict[str, Any]) -> PlannedToolCall:
         if not tool_call_id:
@@ -262,6 +355,183 @@ class ToolRuntime:
             arguments_ref=args_ref,
         )
 
+    def _inspect_work_spec_scope(self, planned: PlannedToolCall) -> InspectionResult | None:
+        work_spec = self._work_spec_var.get()
+        if work_spec is None:
+            return None
+
+        scope = work_spec.resource_scope
+        roots_raw = scope.workspace_roots or []
+        domains_raw = scope.domain_allowlist or []
+        file_types_raw = scope.file_type_allowlist or []
+
+        allowed_roots: list[Path] = []
+        for root in roots_raw:
+            if not isinstance(root, str) or not root.strip():
+                continue
+            try:
+                allowed_roots.append(_resolve_in_project(self._project_root, root.strip()))
+            except Exception:
+                return InspectionResult(
+                    decision=InspectionDecision.DENY,
+                    action_summary="Invalid WorkSpec workspace_roots entry",
+                    risk_level="high",
+                    reason=f"Invalid workspace root: {root!r}",
+                    error_code=ErrorCode.BAD_REQUEST,
+                    diff_ref=None,
+                )
+
+        allowed_file_suffixes: set[str] = set()
+        for ft in file_types_raw:
+            if not isinstance(ft, str):
+                continue
+            norm = ft.strip().lower()
+            if not norm:
+                continue
+            if not norm.startswith("."):
+                norm = "." + norm
+            allowed_file_suffixes.add(norm)
+
+        def _domain_allowed(host: str) -> bool:
+            host_l = host.lower().strip(".")
+            for entry in domains_raw:
+                if not isinstance(entry, str):
+                    continue
+                entry_l = entry.lower().strip().strip(".")
+                if not entry_l:
+                    continue
+                if host_l == entry_l or host_l.endswith("." + entry_l):
+                    return True
+            return False
+
+        if planned.tool_name == "browser__run" and domains_raw:
+            try:
+                steps = parse_browser_steps(planned.arguments.get("steps"))
+            except Exception:
+                return None
+            for step in steps:
+                if not step:
+                    continue
+                if step[0] != "open":
+                    continue
+                url = next((t for t in step[1:] if isinstance(t, str) and "://" in t), None)
+                if not isinstance(url, str) or not url:
+                    continue
+                parsed = urlparse(url)
+                if parsed.scheme not in {"http", "https"}:
+                    continue
+                host = parsed.hostname
+                if isinstance(host, str) and host and not _domain_allowed(host):
+                    diff_ref = self._build_args_preview(planned, summary="Preview for blocked browser__run (WorkSpec)")
+                    return InspectionResult(
+                        decision=InspectionDecision.REQUIRE_APPROVAL,
+                        action_summary="Blocked browser automation outside domain allowlist",
+                        risk_level="high",
+                        reason=f"WorkSpec scope violation: domain not in allowlist: {host}",
+                        error_code=ErrorCode.PERMISSION,
+                        diff_ref=diff_ref,
+                    )
+
+        if not allowed_roots:
+            return None
+
+        def _path_allowed(rel: str) -> bool:
+            try:
+                candidate = _resolve_in_project(self._project_root, rel)
+            except Exception:
+                return False
+            for root in allowed_roots:
+                if candidate == root or root in candidate.parents:
+                    return True
+            return False
+
+        def _file_type_allowed(rel: str) -> bool:
+            if not allowed_file_suffixes:
+                return True
+            suffix = Path(rel).suffix.lower()
+            if not suffix:
+                return False
+            return suffix in allowed_file_suffixes
+
+        target_paths: list[str] = []
+        file_paths: list[str] = []
+
+        if planned.tool_name in {"project__read_text", "project__text_stats"}:
+            p = planned.arguments.get("path")
+            if isinstance(p, str) and p.strip():
+                target_paths.append(p.strip())
+                file_paths.append(p.strip())
+
+        elif planned.tool_name == "project__read_text_many":
+            ps = planned.arguments.get("paths")
+            if isinstance(ps, list):
+                for item in ps:
+                    if isinstance(item, str) and item.strip():
+                        target_paths.append(item.strip())
+                        file_paths.append(item.strip())
+
+        elif planned.tool_name in {"project__list_dir", "project__search_text"}:
+            p = planned.arguments.get("path")
+            if p is None:
+                target_paths.append(".")
+            elif isinstance(p, str) and p.strip():
+                target_paths.append(p.strip())
+
+        elif planned.tool_name == "project__glob":
+            base = planned.arguments.get("base")
+            if base is None:
+                target_paths.append(".")
+            elif isinstance(base, str) and base.strip():
+                target_paths.append(base.strip())
+
+        elif planned.tool_name in {"project__apply_edits", "project__apply_patch", "project__patch"}:
+            try:
+                if planned.tool_name == "project__apply_edits":
+                    from .apply_edits_tool import list_apply_edits_target_paths
+
+                    file_paths = list_apply_edits_target_paths(planned.arguments)
+                elif planned.tool_name == "project__apply_patch":
+                    patch_text = planned.arguments.get("patch")
+                    if isinstance(patch_text, str) and patch_text.strip():
+                        from .apply_patch_tool import list_patch_target_paths
+
+                        file_paths = list_patch_target_paths(patch_text)
+                else:
+                    diff_text = planned.arguments.get("diff")
+                    if isinstance(diff_text, str) and diff_text.strip():
+                        from .patch_tool import unified_diff_target_paths
+
+                        file_paths = unified_diff_target_paths(diff_text)
+                target_paths.extend(file_paths)
+            except Exception:
+                return None
+
+        for rel in target_paths:
+            if not _path_allowed(rel):
+                diff_ref = self._build_args_preview(planned, summary="Preview for blocked path (WorkSpec)")
+                return InspectionResult(
+                    decision=InspectionDecision.REQUIRE_APPROVAL,
+                    action_summary="Blocked path outside workspace scope",
+                    risk_level="high",
+                    reason=f"WorkSpec scope violation: path not in workspace_roots: {rel}",
+                    error_code=ErrorCode.PERMISSION,
+                    diff_ref=diff_ref,
+                )
+
+        for rel in file_paths:
+            if not _file_type_allowed(rel):
+                diff_ref = self._build_args_preview(planned, summary="Preview for blocked file type (WorkSpec)")
+                return InspectionResult(
+                    decision=InspectionDecision.REQUIRE_APPROVAL,
+                    action_summary="Blocked file type outside allowlist",
+                    risk_level="high",
+                    reason=f"WorkSpec scope violation: file type not in allowlist: {rel}",
+                    error_code=ErrorCode.PERMISSION,
+                    diff_ref=diff_ref,
+                )
+
+        return None
+
     def inspect(self, planned: PlannedToolCall) -> InspectionResult:
         tool = self._registry.get(planned.tool_name)
         if tool is None:
@@ -272,6 +542,10 @@ class ToolRuntime:
                 reason="Tool is not registered.",
                 error_code=ErrorCode.TOOL_UNKNOWN,
             )
+
+        work_spec_violation = self._inspect_work_spec_scope(planned)
+        if work_spec_violation is not None:
+            return work_spec_violation
 
         # Domain invariants / mandatory approvals (override all modes).
         if planned.tool_name == "snapshot__rollback":
@@ -302,6 +576,9 @@ class ToolRuntime:
 
         if planned.tool_name in {"spec__apply", "spec__seal"}:
             return self._inspect_spec_workflow(planned)
+
+        if planned.tool_name == "browser__run":
+            return self._inspect_browser_run(planned)
 
         if planned.tool_name == "shell__run" and _shell_run_is_allowlisted(self._project_root, planned.arguments):
             summary = _summarize_shell_run_args(planned.arguments)
@@ -407,6 +684,51 @@ class ToolRuntime:
         return InspectionResult(
             decision=InspectionDecision.ALLOW,
             action_summary=f"Execute tool: {planned.tool_name}",
+            risk_level="low",
+            reason=None,
+            error_code=None,
+            diff_ref=None,
+        )
+
+    def _build_browser_run_preview(self, planned: PlannedToolCall) -> ArtifactRef:
+        steps = parse_browser_steps(planned.arguments.get("steps"))
+        lines: list[str] = ["browser__run", ""]
+        for step in steps:
+            rendered = " ".join(shlex.quote(s) for s in ["agent-browser", *step])
+            lines.append(f"$ {rendered}")
+        lines.append("")
+        preview = "\n".join(lines).rstrip() + "\n"
+        return self._artifact_store.put(preview, kind="diff", meta={"summary": "Browser command preview"})
+
+    def _inspect_browser_run(self, planned: PlannedToolCall) -> InspectionResult:
+        try:
+            steps = parse_browser_steps(planned.arguments.get("steps"))
+        except Exception as e:
+            return InspectionResult(
+                decision=InspectionDecision.DENY,
+                action_summary="Invalid browser command request.",
+                risk_level="high",
+                reason=str(e),
+                error_code=ErrorCode.BAD_REQUEST,
+                diff_ref=None,
+            )
+
+        require_approval = any(_browser_step_is_high_risk(step) for step in steps)
+        if require_approval:
+            diff_ref = self._build_browser_run_preview(planned)
+            return InspectionResult(
+                decision=InspectionDecision.REQUIRE_APPROVAL,
+                action_summary="Run browser automation",
+                risk_level="high",
+                reason="Browser command may change remote or local state.",
+                error_code=None,
+                diff_ref=diff_ref,
+            )
+
+        cmds = ", ".join(step[0] for step in steps if step)
+        return InspectionResult(
+            decision=InspectionDecision.ALLOW,
+            action_summary=f"Run browser automation: {cmds}",
             risk_level="low",
             reason=None,
             error_code=None,

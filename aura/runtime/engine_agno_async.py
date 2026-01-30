@@ -21,10 +21,12 @@ from .context_mgmt import (
 )
 from .error_codes import ErrorCode
 from .event_bus import EventBus
-from .ids import new_id, now_ts_ms
+from .ids import new_id, new_tool_call_id, now_ts_ms
+from .dag_plan_runner import DAGPlanRunner
 from .llm.config import ModelConfig
 from .llm.client_exec_anthropic import complete_anthropic, stream_anthropic
 from .llm.client_exec_gemini import complete_gemini, stream_gemini
+from .llm.client_exec_openai_codex import complete_openai_codex, stream_openai_codex
 from .llm.client_exec_openai_compatible import complete_openai_compatible, stream_openai_compatible
 from .llm.errors import CancellationToken, LLMRequestError, ModelResolutionError
 from .llm.router import ModelRouter
@@ -49,7 +51,7 @@ from .orchestrator_helpers import (
     _summarize_tool_for_ui,
     _tool_calls_from_payload,
 )
-from .plan import PlanStore
+from .plan import PlanStore, TodoStore
 from .protocol import ArtifactRef, Event, EventKind, Op, OpKind
 from .run_snapshots import PendingToolCall as SnapshotPendingToolCall
 from .run_snapshots import RunSnapshot, delete_run_snapshot, read_run_snapshot, write_run_snapshot
@@ -75,6 +77,9 @@ from .tools import (
     SkillListTool,
     SkillLoadTool,
     SkillReadFileTool,
+    BrowserRunTool,
+    DAGExecuteNextTool,
+    UpdateTodoTool,
     SnapshotCreateTool,
     SnapshotDiffTool,
     SnapshotListTool,
@@ -87,8 +92,6 @@ from .tools import (
     SpecSealTool,
     ToolRegistry,
     UpdatePlanTool,
-    WebFetchTool,
-    WebSearchTool,
 )
 from .tools.runtime import (
     InspectionDecision,
@@ -126,7 +129,7 @@ def _normalize_tool_calls(tool_calls: list[ToolCall] | None) -> list[ToolCall]:
     out: list[ToolCall] = []
     for tc in tool_calls or []:
         call_id = tc.tool_call_id
-        call_id = call_id.strip() if isinstance(call_id, str) and call_id.strip() else new_id("call")
+        call_id = call_id.strip() if isinstance(call_id, str) and call_id.strip() else new_tool_call_id()
         name = tc.name.split(":", 1)[-1].strip()
         out.append(
             ToolCall(
@@ -153,8 +156,9 @@ _DEFAULT_EXPOSED_TOOL_NAMES: set[str] = {
     "project__patch",
     # System / network (approval-gated)
     "shell__run",
-    "web__fetch",
-    "web__search",
+    # Browser automation (approval-gated per-step via ToolRuntime inspection)
+    "browser__run",
+
     # Session / skills / planning
     "session__search",
     "session__export",
@@ -162,6 +166,7 @@ _DEFAULT_EXPOSED_TOOL_NAMES: set[str] = {
     "skill__load",
     "skill__read_file",
     "update_plan",
+    "update_todo",
     # Spec workflow
     "spec__query",
     "spec__get",
@@ -170,6 +175,8 @@ _DEFAULT_EXPOSED_TOOL_NAMES: set[str] = {
     "spec__seal",
     # Subagents
     "subagent__run",
+    # DAG scheduling
+    "dag__execute_next",
 }
 
 
@@ -195,6 +202,7 @@ class AgnoAsyncEngine:
     model_router: ModelRouter = field(init=False)
     skill_store: SkillStore = field(init=False)
     plan_store: PlanStore = field(init=False)
+    todo_store: TodoStore = field(init=False)
     spec_store: SpecStore = field(init=False)
     spec_state_store: SpecStateStore = field(init=False)
     spec_proposal_store: SpecProposalStore = field(init=False)
@@ -215,6 +223,7 @@ class AgnoAsyncEngine:
         self.model_router = ModelRouter(self.model_config)
         self.skill_store = SkillStore(project_root=self.project_root)
         self.plan_store = PlanStore(session_store=self.session_store, session_id=self.session_id)
+        self.todo_store = TodoStore(session_store=self.session_store, session_id=self.session_id)
         self.spec_store = SpecStore(project_root=self.project_root)
         self.spec_state_store = SpecStateStore(project_root=self.project_root)
         self.spec_proposal_store = SpecProposalStore(project_root=self.project_root)
@@ -237,14 +246,14 @@ class AgnoAsyncEngine:
         registry.register(ProjectTextStatsTool())
         registry.register(ProjectAIGCDetectTool())
         registry.register(ShellRunTool())
-        registry.register(WebFetchTool())
-        registry.register(WebSearchTool())
+        registry.register(BrowserRunTool(artifact_store=self.artifact_store))
         registry.register(SessionSearchTool())
         registry.register(SessionExportTool())
         registry.register(SkillListTool(self.skill_store))
         registry.register(SkillLoadTool(self.skill_store))
         registry.register(SkillReadFileTool(self.skill_store))
         registry.register(UpdatePlanTool(self.plan_store))
+        registry.register(UpdateTodoTool(self.todo_store))
         registry.register(SpecQueryTool(self.spec_store))
         registry.register(SpecGetTool(self.spec_store))
         registry.register(
@@ -263,14 +272,16 @@ class AgnoAsyncEngine:
         try:
             from .tools.subagent_runner import SubagentRunTool
 
-            registry.register(
-                SubagentRunTool(
-                    model_router=self.model_router,
-                    tool_registry=registry,
-                    tool_runtime=tool_runtime,
-                    artifact_store=self.artifact_store,
-                )
+            subagent_tool = SubagentRunTool(
+                model_router=self.model_router,
+                tool_registry=registry,
+                tool_runtime=tool_runtime,
+                artifact_store=self.artifact_store,
             )
+            registry.register(subagent_tool)
+
+            dag_runner = DAGPlanRunner(plan_store=self.plan_store, max_parallel=3)
+            registry.register(DAGExecuteNextTool(dag_runner=dag_runner, subagent_tool=subagent_tool))
         except Exception:
             pass
 
@@ -302,7 +313,12 @@ class AgnoAsyncEngine:
         )
         cfg.validate_consistency()
         self.model_config = cfg
-        self.model_router = ModelRouter(cfg)
+        # Preserve the ModelRouter instance so existing tool instances (e.g. subagent__run)
+        # observe model switches without being re-registered.
+        if self.model_router is None:
+            self.model_router = ModelRouter(cfg)
+        else:
+            self.model_router.set_config(cfg)
 
     def load_history_from_events(self) -> None:
         history: list[CanonicalMessage] = []
@@ -534,10 +550,12 @@ class AgnoAsyncEngine:
 
         # Clear approvals if all required decisions are present.
         approval_id = snapshot.approval_id
+        approval_record: ApprovalRecord | None = None
         if approval_id:
             try:
                 record = self.approval_store.get(approval_id)
-                if record.status is ApprovalStatus.PENDING:
+                approval_record = record
+                if approval_record.status is ApprovalStatus.PENDING:
                     record_decision = {
                         "decisions": [
                             {"tool_call_id": d.tool_call_id, "decision": d.decision, "note": d.note}
@@ -546,10 +564,33 @@ class AgnoAsyncEngine:
                         "decided_at": now_ts_ms(),
                     }
                     status = ApprovalStatus.GRANTED if any(d.decision == "approve" for d in decisions) else ApprovalStatus.DENIED
-                    updated = replace(record, status=status, decision=record_decision)
+                    updated = replace(approval_record, status=status, decision=record_decision)
                     self.approval_store.update(updated)
+                    approval_record = updated
             except Exception:
                 pass
+
+        # If this approval originated from a subagent run, auto-resume the delegated work
+        # after the user approves, so the subagent continues without requiring the main agent
+        # to manually re-dispatch it.
+        if (
+            approval_record is not None
+            and isinstance(approval_record.resume_payload, dict)
+            and approval_record.resume_payload.get("source") == "subagent"
+            and any(d.decision == "approve" for d in decisions)
+        ):
+            await self._auto_resume_subagent_after_approval(
+                approval_record=approval_record,
+                request_id=run_id,
+                turn_id=turn_id,
+                pending_tools=pending,
+                decision_map=decision_map,
+                timeout_s=timeout_s,
+                cancel=cancel,
+            )
+            # We already executed the approved tool calls (and re-dispatched the subagent).
+            pending = []
+            decision_map = {}
 
         result = await self._run_tool_loop(
             request_id=run_id,
@@ -562,6 +603,141 @@ class AgnoAsyncEngine:
         if result.status != "needs_approval":
             delete_run_snapshot(project_root=self.project_root, run_id=run_id)
         return result
+
+    async def _auto_resume_subagent_after_approval(
+        self,
+        *,
+        approval_record: ApprovalRecord,
+        request_id: str,
+        turn_id: str | None,
+        pending_tools: list[SnapshotPendingToolCall],
+        decision_map: dict[str, ToolDecision],
+        timeout_s: float | None,
+        cancel: CancellationToken | None,
+    ) -> None:
+        """
+        Execute the approved tool calls, then re-dispatch the original subagent run with a resume hint.
+
+        This provides the UX the user expects: approve -> delegated worker continues.
+        """
+        cancel = cancel or CancellationToken()
+        if cancel.cancelled:
+            return
+        if self.tool_registry is None or self.tool_runtime is None:
+            return
+        if self._history is None:
+            self._history = []
+
+        sub_payload = approval_record.resume_payload.get("subagent") if isinstance(approval_record.resume_payload, dict) else None
+        if not isinstance(sub_payload, dict):
+            return
+        run_args = sub_payload.get("run_args")
+        if not isinstance(run_args, dict) or not run_args:
+            return
+
+        executed: list[dict[str, Any]] = []
+
+        async with AsyncExitStack() as stack:
+            mcp_functions, _mcp_specs = await self._load_mcp_tooling(stack=stack)
+
+            # 1) Execute the approved pending tool calls (without an extra main-agent LLM turn).
+            for t in list(pending_tools):
+                if cancel.cancelled:
+                    return
+                tool_call_id = t.tool_call_id
+                # These approved tool calls originate from a paused approval, not from an LLM tool-call turn.
+                # To keep downstream providers happy (and to make the transcript auditable), we synthesize
+                # an assistant tool-call message for each approved tool call before emitting the tool result.
+                self._history.append(
+                    CanonicalMessage(
+                        role=CanonicalMessageRole.ASSISTANT,
+                        content="",
+                        tool_calls=[ToolCall(tool_call_id=tool_call_id, name=t.tool_name, arguments=deepcopy(t.args))],
+                    )
+                )
+                planned = self.tool_runtime.plan(
+                    tool_execution_id=f"tool_{tool_call_id}",
+                    tool_name=t.tool_name,
+                    tool_call_id=tool_call_id,
+                    arguments=dict(t.args),
+                )
+                inspection = self._inspect_tool(planned=planned, mcp_functions=mcp_functions)
+                decision = decision_map.get(tool_call_id)
+                tool_message = await self._execute_planned_after_decisions(
+                    planned=planned,
+                    inspection=inspection,
+                    decision=decision,
+                    request_id=request_id,
+                    turn_id=turn_id,
+                    mcp_functions=mcp_functions,
+                )
+                self._history.append(
+                    CanonicalMessage(
+                        role=CanonicalMessageRole.TOOL,
+                        content=tool_message,
+                        tool_call_id=tool_call_id,
+                        tool_name=t.tool_name,
+                    )
+                )
+                executed.append(
+                    {
+                        "tool_name": t.tool_name,
+                        "tool_call_id": tool_call_id,
+                        "args": dict(t.args),
+                        # Keep as text; the subagent can decide what to do next.
+                        "tool_message": tool_message,
+                    }
+                )
+
+            # 2) Re-dispatch the subagent with a resume hint that includes the approved tool outcomes.
+            resume_args = deepcopy(run_args)
+            ctx = resume_args.get("context")
+            if not isinstance(ctx, dict):
+                ctx = {}
+            text = ctx.get("text")
+            if not isinstance(text, str):
+                text = ""
+            hint = {
+                "kind": "approval_resume",
+                "approved_tools": executed,
+                "note": "User approved the previously blocked tool call(s). Continue the delegated work. Do not ask the user again for the same approval; proceed using the current workspace state.",
+            }
+            ctx["resume"] = hint
+            ctx["text"] = (text + "\n\n[Approval resume]\nThe user approved the previously blocked tool call(s). Continue.").strip()
+            resume_args["context"] = ctx
+
+            call_id = new_tool_call_id()
+            # Add a synthetic assistant tool-call message so the next TOOL message is well-formed.
+            self._history.append(
+                CanonicalMessage(
+                    role=CanonicalMessageRole.ASSISTANT,
+                    content="",
+                    tool_calls=[ToolCall(tool_call_id=call_id, name="subagent__run", arguments=deepcopy(resume_args))],
+                )
+            )
+            planned_sub = self.tool_runtime.plan(
+                tool_execution_id=f"tool_{call_id}",
+                tool_name="subagent__run",
+                tool_call_id=call_id,
+                arguments=deepcopy(resume_args),
+            )
+            inspection_sub = self._inspect_tool(planned=planned_sub, mcp_functions=mcp_functions)
+            tool_message_sub = await self._execute_planned_after_decisions(
+                planned=planned_sub,
+                inspection=inspection_sub,
+                decision=None,
+                request_id=request_id,
+                turn_id=turn_id,
+                mcp_functions=mcp_functions,
+            )
+            self._history.append(
+                CanonicalMessage(
+                    role=CanonicalMessageRole.TOOL,
+                    content=tool_message_sub,
+                    tool_call_id=call_id,
+                    tool_name="subagent__run",
+                )
+            )
 
     async def _arun_chat(
         self,
@@ -1005,6 +1181,237 @@ class AgnoAsyncEngine:
                             tool_name=planned.tool_name,
                         )
                     )
+                    # Subagent approval passthrough: if subagent__run returns needs_approval,
+                    # convert the requested internal tool calls into a first-class approval pause
+                    # so UIs can prompt the user directly (CLI/web/mobile) without relying on the main agent.
+                    if planned.tool_name == "subagent__run":
+                        try:
+                            msg = json.loads(tool_message)
+                        except Exception:
+                            msg = None
+                        if isinstance(msg, dict):
+                            sub = msg.get("result")
+                            if isinstance(sub, dict) and str(sub.get("status") or "") == "needs_approval":
+                                report = sub.get("report")
+                                if isinstance(report, str):
+                                    try:
+                                        report_any = json.loads(report)
+                                    except Exception:
+                                        report_any = None
+                                    report = report_any
+
+                                needs_raw = report.get("needs_approval") if isinstance(report, dict) else None
+                                needs_list: list[dict[str, Any]] = []
+                                if isinstance(needs_raw, dict):
+                                    needs_list = [needs_raw]
+                                elif isinstance(needs_raw, list):
+                                    needs_list = [x for x in needs_raw if isinstance(x, dict)]
+
+                                if needs_list and self.tool_runtime is not None:
+                                    pending_planned: list[PlannedToolCall] = []
+                                    for req in needs_list:
+                                        tool_name = req.get("tool_name")
+                                        tool_call_id = req.get("tool_call_id")
+                                        args_ref = req.get("arguments_ref")
+                                        if not isinstance(tool_name, str) or not tool_name.strip():
+                                            continue
+                                        if not isinstance(tool_call_id, str) or not tool_call_id.strip():
+                                            tool_call_id = new_tool_call_id()
+                                        args: dict[str, Any] = {}
+                                        if isinstance(args_ref, dict):
+                                            try:
+                                                ref = ArtifactRef.from_dict(args_ref)
+                                                raw_args = self.artifact_store.get(ref)
+                                                parsed = json.loads(raw_args.decode("utf-8", errors="replace"))
+                                                if isinstance(parsed, dict):
+                                                    args = parsed
+                                            except Exception:
+                                                args = {}
+                                        pending_planned.append(
+                                            self.tool_runtime.plan(
+                                                tool_execution_id=f"tool_{tool_call_id}",
+                                                tool_name=tool_name.strip(),
+                                                tool_call_id=tool_call_id.strip(),
+                                                arguments=args,
+                                            )
+                                        )
+
+                                    if pending_planned:
+                                        focus_req = needs_list[0]
+                                        focus_action = str(focus_req.get("action_summary") or focus_req.get("summary") or "").strip()
+                                        if focus_action:
+                                            focus_action = f"Subagent requested approval: {focus_action}"
+                                        else:
+                                            focus_action = "Subagent requested approval"
+                                        focus_risk = str(focus_req.get("risk_level") or "high").strip() or "high"
+                                        focus_reason = str(focus_req.get("reason") or "Delegated task requested approval.").strip()
+                                        focus_inspection = self._inspect_tool(planned=pending_planned[0], mcp_functions=mcp_functions)
+
+                                        class _PauseInspection:
+                                            action_summary: str = focus_action
+                                            risk_level: str = focus_risk
+                                            reason: str = focus_reason
+                                            diff_ref: Any | None = getattr(focus_inspection, "diff_ref", None)
+
+                                        approval_id = await self._pause_run(
+                                            request_id=request_id,
+                                            turn_id=turn_id,
+                                            planned_calls=pending_planned,
+                                            context_stats=context_stats,
+                                            model_profile_id=getattr(profile, "profile_id", None),
+                                            inspection=_PauseInspection(),
+                                            focus_tool_call_id=pending_planned[0].tool_call_id,
+                                            resume_payload_extra={
+                                                "source": "subagent",
+                                                "subagent": {
+                                                    "subagent_run_id": sub.get("subagent_run_id"),
+                                                    "preset": sub.get("preset"),
+                                                    "origin_tool_call_id": planned.tool_call_id,
+                                                    "origin_tool_execution_id": planned.tool_execution_id,
+                                                    "transcript_ref": sub.get("transcript_ref"),
+                                                    # Needed to continue the delegated work after the user approves.
+                                                    # This is safe to persist: it's a plain JSON dict (no local paths required here).
+                                                    "run_args": dict(planned.arguments) if isinstance(planned.arguments, dict) else {},
+                                                },
+                                            },
+                                        )
+                                        return RunResult(
+                                            status="needs_approval",
+                                            run_id=request_id,
+                                            session_id=self.session_id,
+                                            approval_id=approval_id,
+                                            pending_tools=[
+                                                PendingToolCall(tool_call_id=p.tool_call_id, tool_name=p.tool_name, args=dict(p.arguments))
+                                                for p in pending_planned
+                                            ],
+                                            error="Subagent requested approval.",
+                                        )
+
+                    # DAG approval passthrough: `dag__execute_next` may dispatch subagents that request
+                    # approvals for internal tool calls (e.g. shell commands). Convert those into a
+                    # first-class approval pause so the CLI/web UI can show a direct y/n prompt without
+                    # requiring an extra main-agent LLM turn.
+                    if planned.tool_name == "dag__execute_next":
+                        try:
+                            msg = json.loads(tool_message)
+                        except Exception:
+                            msg = None
+
+                        needs_list: list[dict[str, Any]] = []
+                        blocked_node: str | None = None
+                        if isinstance(msg, dict):
+                            dag_res = msg.get("result")
+                            if isinstance(dag_res, dict):
+                                blocked_node_raw = dag_res.get("blocked_node")
+                                if isinstance(blocked_node_raw, str) and blocked_node_raw.strip():
+                                    blocked_node = blocked_node_raw.strip()
+                                blocked = dag_res.get("blocked_approval")
+                                if isinstance(blocked, dict):
+                                    reqs = blocked.get("requests")
+                                    if isinstance(reqs, list):
+                                        needs_list = [r for r in reqs if isinstance(r, dict)]
+                                    else:
+                                        needs_list = [blocked]
+                                elif isinstance(blocked, list):
+                                    needs_list = [r for r in blocked if isinstance(r, dict)]
+                                else:
+                                    node_results = dag_res.get("node_results")
+                                    if isinstance(node_results, dict):
+                                        for node_any in node_results.values():
+                                            if not isinstance(node_any, dict):
+                                                continue
+                                            if str(node_any.get("status") or "") != "needs_approval":
+                                                continue
+                                            req = node_any.get("approval_request")
+                                            if isinstance(req, dict):
+                                                needs_list.append(req)
+
+                        if needs_list and self.tool_runtime is not None:
+                            pending_planned: list[PlannedToolCall] = []
+                            for req in needs_list:
+                                tool_name = req.get("tool_name")
+                                if not isinstance(tool_name, str) or not tool_name.strip():
+                                    tool_name = req.get("tool")
+                                if not isinstance(tool_name, str) or not tool_name.strip():
+                                    continue
+                                tool_call_id = req.get("tool_call_id")
+                                if not isinstance(tool_call_id, str) or not tool_call_id.strip():
+                                    tool_call_id = new_tool_call_id()
+
+                                args: dict[str, Any] = {}
+                                args_ref = req.get("arguments_ref")
+                                if isinstance(args_ref, dict):
+                                    try:
+                                        ref = ArtifactRef.from_dict(args_ref)
+                                        raw_args = self.artifact_store.get(ref)
+                                        parsed = json.loads(raw_args.decode("utf-8", errors="replace"))
+                                        if isinstance(parsed, dict):
+                                            args = parsed
+                                    except Exception:
+                                        args = {}
+                                elif isinstance(req.get("arguments"), dict):
+                                    args = dict(req["arguments"])
+
+                                pending_planned.append(
+                                    self.tool_runtime.plan(
+                                        tool_execution_id=f"tool_{tool_call_id}",
+                                        tool_name=tool_name.strip(),
+                                        tool_call_id=tool_call_id.strip(),
+                                        arguments=args,
+                                    )
+                                )
+
+                            if pending_planned:
+                                focus_req = needs_list[0]
+                                focus_action = str(focus_req.get("action_summary") or focus_req.get("summary") or "").strip()
+                                if blocked_node:
+                                    prefix = f"DAG node {blocked_node} requested approval"
+                                else:
+                                    prefix = "DAG requested approval"
+                                if focus_action:
+                                    focus_action = f"{prefix}: {focus_action}"
+                                else:
+                                    focus_action = prefix
+                                focus_risk = str(focus_req.get("risk_level") or "high").strip() or "high"
+                                focus_reason = str(focus_req.get("reason") or "DAG-dispatched subagent requested approval.").strip()
+                                focus_inspection = self._inspect_tool(planned=pending_planned[0], mcp_functions=mcp_functions)
+
+                                class _PauseInspection:
+                                    action_summary: str = focus_action
+                                    risk_level: str = focus_risk
+                                    reason: str = focus_reason
+                                    diff_ref: Any | None = getattr(focus_inspection, "diff_ref", None)
+
+                                approval_id = await self._pause_run(
+                                    request_id=request_id,
+                                    turn_id=turn_id,
+                                    planned_calls=pending_planned,
+                                    context_stats=context_stats,
+                                    model_profile_id=getattr(profile, "profile_id", None),
+                                    inspection=_PauseInspection(),
+                                    focus_tool_call_id=pending_planned[0].tool_call_id,
+                                    resume_payload_extra={
+                                        "source": "dag",
+                                        "dag": {
+                                            "blocked_node": blocked_node,
+                                            "origin_tool_call_id": planned.tool_call_id,
+                                            "origin_tool_execution_id": planned.tool_execution_id,
+                                            # Use this to optionally re-dispatch after approval.
+                                            "dag_execute_args": dict(planned.arguments) if isinstance(planned.arguments, dict) else {},
+                                        },
+                                    },
+                                )
+                                return RunResult(
+                                    status="needs_approval",
+                                    run_id=request_id,
+                                    session_id=self.session_id,
+                                    approval_id=approval_id,
+                                    pending_tools=[
+                                        PendingToolCall(tool_call_id=p.tool_call_id, tool_name=p.tool_name, args=dict(p.arguments))
+                                        for p in pending_planned
+                                    ],
+                                    error="DAG requested approval.",
+                                )
 
                 request = self._build_request(profile=profile, extra_tools=mcp_specs)
 
@@ -1294,6 +1701,14 @@ class AgnoAsyncEngine:
                     cancel=cancel,
                     trace=trace,
                 )
+            if kind is ProviderKind.OPENAI_CODEX:
+                return complete_openai_codex(
+                    profile=profile,
+                    request=request,
+                    timeout_s=timeout_s,
+                    cancel=cancel,
+                    trace=trace,
+                )
             if kind is ProviderKind.ANTHROPIC:
                 return complete_anthropic(
                     profile=profile,
@@ -1345,6 +1760,8 @@ class AgnoAsyncEngine:
             kind = profile.provider_kind
             if kind is ProviderKind.OPENAI_COMPATIBLE:
                 return stream_openai_compatible(profile=profile, request=request, timeout_s=timeout_s, cancel=cancel, trace=trace)
+            if kind is ProviderKind.OPENAI_CODEX:
+                return stream_openai_codex(profile=profile, request=request, timeout_s=timeout_s, cancel=cancel, trace=trace)
             if kind is ProviderKind.ANTHROPIC:
                 return stream_anthropic(profile=profile, request=request, timeout_s=timeout_s, cancel=cancel, trace=trace)
             if kind is ProviderKind.GEMINI:
@@ -1412,48 +1829,9 @@ class AgnoAsyncEngine:
         even before the model generates output. Aura keeps strict schemas for local/runtime validation, but
         adapts the *declared* tool schemas for compatibility at request time.
         """
+        from .tools.schema_compat import adapt_tool_specs_for_profile
 
-        if profile.provider_kind is not ProviderKind.GEMINI:
-            return tools
-
-        def _strip_unsupported(obj: Any) -> None:
-            if isinstance(obj, dict):
-                # Remove higher-order schema constructs that are frequently unsupported.
-                obj.pop("oneOf", None)
-                obj.pop("anyOf", None)
-                obj.pop("allOf", None)
-                # Convert `const` to `enum` (best-effort).
-                if "const" in obj:
-                    const_val = obj.pop("const")
-                    if "enum" not in obj:
-                        obj["enum"] = [const_val]
-                for v in list(obj.values()):
-                    _strip_unsupported(v)
-            elif isinstance(obj, list):
-                for v in obj:
-                    _strip_unsupported(v)
-
-        from .tools.apply_edits_tool import gemini_compatible_apply_edits_input_schema
-
-        out: list[ToolSpec] = []
-        for spec in tools:
-            if spec.name == "project__apply_edits":
-                schema = gemini_compatible_apply_edits_input_schema()
-            else:
-                schema = deepcopy(spec.input_schema) if isinstance(spec.input_schema, dict) else {"type": "object", "properties": {}}
-                _strip_unsupported(schema)
-                if spec.name == "subagent__run":
-                    # Simplify union types in context.files.items for Gemini schema compatibility.
-                    try:
-                        ctx = schema.get("properties", {}).get("context")
-                        files = ctx.get("properties", {}).get("files") if isinstance(ctx, dict) else None
-                        if isinstance(files, dict) and isinstance(files.get("items"), dict):
-                            files["items"] = {"type": "string"}
-                    except Exception:
-                        pass
-
-            out.append(ToolSpec(name=spec.name, description=spec.description, input_schema=schema))
-        return out
+        return adapt_tool_specs_for_profile(tools=tools, profile=profile)
 
     def _build_request(self, *, profile: ModelProfile | None = None, extra_tools: list[ToolSpec] | None = None) -> CanonicalRequest:
         tools: list[ToolSpec] = []
@@ -1467,12 +1845,13 @@ class AgnoAsyncEngine:
             except Exception:
                 pass
         skills = self.skill_store.list()
-        plan = self.plan_store.get().plan
+        dag_plan = self.plan_store.get().plan
+        todo = self.todo_store.get().todo
 
         state = self.spec_state_store.get()
         spec_summary = SpecStatusSummary(status=state.status, label=state.label)
 
-        surface = build_agent_surface(tools=tools, skills=skills, plan=plan, spec=spec_summary)
+        surface = build_agent_surface(tools=tools, skills=skills, dag_plan=dag_plan, todo=todo, spec=spec_summary)
 
         base_system = self.system_prompt or _load_default_system_prompt()
         parts = [base_system]
@@ -1619,9 +1998,24 @@ class AgnoAsyncEngine:
     ) -> str:
         if inspection.decision is InspectionDecision.DENY:
             return await self._tool_result_denied(planned=planned, inspection=inspection, request_id=request_id, turn_id=turn_id)
+        # Respect explicit denial decisions even if the tool would otherwise be allowed.
+        # This is important for approvals that originate outside the main LLM tool gating
+        # (e.g. delegated/subagent approvals surfaced to the user).
+        if decision is not None and decision.decision != "approve":
+            return await self._tool_result_denied_by_user(
+                planned=planned,
+                request_id=request_id,
+                turn_id=turn_id,
+                note=decision.note,
+            )
         if inspection.decision is InspectionDecision.REQUIRE_APPROVAL:
             if decision is None or decision.decision != "approve":
-                return await self._tool_result_denied_by_user(planned=planned, request_id=request_id, turn_id=turn_id)
+                return await self._tool_result_denied_by_user(
+                    planned=planned,
+                    request_id=request_id,
+                    turn_id=turn_id,
+                    note=(decision.note if decision is not None else None),
+                )
         if self.tool_runtime is None:
             raise RuntimeError("Tool runtime not initialized.")
         if self.tool_runtime.get_tool(planned.tool_name) is not None:
@@ -1649,6 +2043,7 @@ class AgnoAsyncEngine:
                 "tool_name": planned.tool_name,
                 "tool_call_id": planned.tool_call_id,
                 "arguments_ref": planned.arguments_ref.to_dict(),
+                "summary": f"MCP: {planned.tool_name}",
                 "tool_kind": "mcp",
             },
             request_id=request_id,
@@ -1704,6 +2099,7 @@ class AgnoAsyncEngine:
                     "tool_execution_id": planned.tool_execution_id,
                     "tool_name": planned.tool_name,
                     "tool_call_id": planned.tool_call_id,
+                    "summary": f"MCP: {planned.tool_name}",
                     "status": "failed",
                     "duration_ms": duration_ms,
                     "output_ref": output_ref.to_dict(),
@@ -1732,6 +2128,7 @@ class AgnoAsyncEngine:
                 "tool_execution_id": planned.tool_execution_id,
                 "tool_name": planned.tool_name,
                 "tool_call_id": planned.tool_call_id,
+                "summary": f"MCP: {planned.tool_name}",
                 "status": "succeeded",
                 "duration_ms": duration_ms,
                 "output_ref": output_ref.to_dict(),
@@ -1859,6 +2256,7 @@ class AgnoAsyncEngine:
         model_profile_id: str | None,
         inspection: Any | None,
         focus_tool_call_id: str | None,
+        resume_payload_extra: dict[str, Any] | None = None,
     ) -> str:
         approval_id = new_id("appr")
         action_summary = f"Approve to execute {len(planned_calls)} tool call(s)."
@@ -1887,6 +2285,18 @@ class AgnoAsyncEngine:
             except Exception:
                 pass
 
+        resume_payload: dict[str, Any] = {
+            "tool_calls": [
+                {"tool_name": p.tool_name, "tool_call_id": p.tool_call_id, "arguments_ref": p.arguments_ref.to_dict()}
+                for p in planned_calls
+            ]
+        }
+        if isinstance(resume_payload_extra, dict):
+            for k, v in resume_payload_extra.items():
+                if k == "tool_calls":
+                    continue
+                resume_payload[k] = v
+
         record = ApprovalRecord(
             approval_id=approval_id,
             session_id=self.session_id,
@@ -1900,12 +2310,7 @@ class AgnoAsyncEngine:
             reason=reason,
             diff_ref=diff_ref,
             resume_kind="run_continue",
-            resume_payload={
-                "tool_calls": [
-                    {"tool_name": p.tool_name, "tool_call_id": p.tool_call_id, "arguments_ref": p.arguments_ref.to_dict()}
-                    for p in planned_calls
-                ]
-            },
+            resume_payload=resume_payload,
         )
         self.approval_store.create(record)
         await self._emit(
@@ -1971,6 +2376,7 @@ class AgnoAsyncEngine:
                 "tool_name": planned.tool_name,
                 "tool_call_id": planned.tool_call_id,
                 "arguments_ref": planned.arguments_ref.to_dict(),
+                "summary": _summarize_tool_for_ui(planned.tool_name, planned.arguments),
             },
             request_id=request_id,
             turn_id=turn_id,
@@ -2018,6 +2424,7 @@ class AgnoAsyncEngine:
                     "tool_execution_id": planned.tool_execution_id,
                     "tool_name": planned.tool_name,
                     "tool_call_id": planned.tool_call_id,
+                    "summary": _summarize_tool_for_ui(planned.tool_name, planned.arguments),
                     "status": "failed",
                     "duration_ms": duration_ms,
                     "output_ref": output_ref.to_dict(),
@@ -2069,15 +2476,27 @@ class AgnoAsyncEngine:
             step_id=planned.tool_execution_id,
         )
 
-        if planned.tool_name == "update_plan":
+        if planned.tool_name in {"update_plan", "update_todo"}:
             try:
-                state = self.plan_store.get()
+                if planned.tool_name == "update_plan":
+                    state = self.plan_store.get()
+                    plan_type = "dag"
+                    items = state.plan
+                    explanation = state.explanation
+                    updated_at = state.updated_at
+                else:
+                    state = self.todo_store.get()
+                    plan_type = "todo"
+                    items = state.todo
+                    explanation = state.explanation
+                    updated_at = state.updated_at
                 await self._emit(
                     kind=EventKind.PLAN_UPDATE,
                     payload={
-                        "plan": [t.to_dict() for t in state.plan],
-                        "explanation": state.explanation,
-                        "updated_at": state.updated_at,
+                        "plan_type": plan_type,
+                        "plan": [t.to_dict() for t in items],
+                        "explanation": explanation,
+                        "updated_at": updated_at,
                     },
                     request_id=request_id,
                     turn_id=turn_id,
@@ -2106,13 +2525,28 @@ class AgnoAsyncEngine:
             status="denied",
         )
 
-    async def _tool_result_denied_by_user(self, *, planned: PlannedToolCall, request_id: str, turn_id: str | None) -> str:
+    async def _tool_result_denied_by_user(
+        self,
+        *,
+        planned: PlannedToolCall,
+        request_id: str,
+        turn_id: str | None,
+        note: str | None = None,
+    ) -> str:
+        note_clean: str | None = None
+        if isinstance(note, str) and note.strip():
+            note_clean = " ".join(note.strip().splitlines()).strip()
+            if len(note_clean) > 400:
+                note_clean = note_clean[:399].rstrip() + "…"
+        msg = "Approval denied."
+        if note_clean:
+            msg = f"{msg} User note: {note_clean}"
         return await self._tool_result_error(
             planned=planned,
             request_id=request_id,
             turn_id=turn_id,
             error_code=ErrorCode.CANCELLED.value,
-            error_message="Approval denied.",
+            error_message=msg,
             status="cancelled",
         )
 

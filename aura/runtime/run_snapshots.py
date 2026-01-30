@@ -163,6 +163,8 @@ def _message_to_dict(msg: CanonicalMessage) -> dict[str, Any]:
             }
             for tc in msg.tool_calls
         ]
+    if msg.reasoning_content is not None:
+        out["reasoning_content"] = msg.reasoning_content
     return out
 
 
@@ -208,4 +210,5 @@ def _message_from_dict(raw: dict[str, Any]) -> CanonicalMessage:
         tool_call_id=tool_call_id,
         tool_name=tool_name,
         tool_calls=tool_calls,
+        reasoning_content=raw.get("reasoning_content") if isinstance(raw.get("reasoning_content"), str) else None,
     )

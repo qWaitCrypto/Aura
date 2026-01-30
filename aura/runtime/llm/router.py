@@ -20,6 +20,18 @@ class ModelRouter:
     def __init__(self, config: ModelConfig) -> None:
         self._config = config
 
+    def set_config(self, config: ModelConfig) -> None:
+        """
+        Replace the underlying ModelConfig in-place.
+
+        Important: Engines/tools may hold a long-lived reference to a ModelRouter
+        instance. Updating the config in-place ensures those references observe
+        runtime model switches (e.g. /model in the CLI) without needing to
+        rebuild and re-register tools.
+        """
+
+        self._config = config
+
     def resolve(self, *, role: ModelRole, requirements: ModelRequirements) -> ResolvedModel:
         profile_id = self._config.role_pointers.get(role)
         if profile_id is None:

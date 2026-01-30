@@ -7,6 +7,7 @@ from typing import Any
 
 class ProviderKind(StrEnum):
     OPENAI_COMPATIBLE = "openai_compatible"
+    OPENAI_CODEX = "openai_codex"
     ANTHROPIC = "anthropic"
     GEMINI = "gemini"
 
@@ -59,11 +60,21 @@ class ModelCapabilities:
     def with_provider_defaults(self, provider_kind: ProviderKind) -> "ModelCapabilities":
         supports_streaming = self.supports_streaming
         if supports_streaming is None:
-            if provider_kind in (ProviderKind.OPENAI_COMPATIBLE, ProviderKind.ANTHROPIC, ProviderKind.GEMINI):
+            if provider_kind in (
+                ProviderKind.OPENAI_COMPATIBLE,
+                ProviderKind.OPENAI_CODEX,
+                ProviderKind.ANTHROPIC,
+                ProviderKind.GEMINI,
+            ):
                 supports_streaming = True
         supports_tools = self.supports_tools
         if supports_tools is None:
-            if provider_kind in (ProviderKind.OPENAI_COMPATIBLE, ProviderKind.ANTHROPIC, ProviderKind.GEMINI):
+            if provider_kind in (
+                ProviderKind.OPENAI_COMPATIBLE,
+                ProviderKind.OPENAI_CODEX,
+                ProviderKind.ANTHROPIC,
+                ProviderKind.GEMINI,
+            ):
                 supports_tools = True
         return ModelCapabilities(
             supports_tools=supports_tools,
@@ -109,6 +120,9 @@ class CanonicalMessage:
     tool_call_id: str | None = None
     tool_name: str | None = None
     tool_calls: list[ToolCall] | None = None
+    # Some OpenAI-compatible gateways (e.g. Moonshot/Kimi) require assistant tool-call
+    # messages to include `reasoning_content` when "thinking" is enabled server-side.
+    reasoning_content: str | None = None
 
 
 @dataclass(frozen=True)
@@ -154,6 +168,7 @@ class LLMResponse:
     usage: LLMUsage | None = None
     stop_reason: str | None = None
     request_id: str | None = None
+    thinking: str | None = None
 
 
 class LLMStreamEventKind(StrEnum):

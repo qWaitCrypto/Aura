@@ -4,9 +4,10 @@ from dataclasses import dataclass
 from typing import Any, ClassVar
 
 from ..llm.router import ModelRouter
+from ..models import WorkSpec
 from ..stores import ArtifactStore
-from ..subagents import get_preset, run_subagent
-from ..subagents.presets import preset_input_schema
+from ..subagents.presets import get_preset, preset_input_schema
+from ..subagents.runner import run_subagent
 from .registry import ToolRegistry
 from .runtime import ToolExecutionContext, ToolRuntime
 
@@ -21,7 +22,8 @@ class SubagentRunTool:
     name: ClassVar[str] = "subagent__run"
     description: ClassVar[str] = (
         "Run a bounded delegated task in an isolated subagent context. "
-        "Use for verification (preset=verifier) or for executing a small tool chain with receipts (preset=tool_interpreter). "
+        "Use for verification (preset=verifier), documents (preset=doc_worker), spreadsheets (preset=sheet_worker), "
+        "browser automation (preset=browser_worker), or file operations (preset=file_ops_worker). "
         "The runner enforces a per-run tool allowlist, prevents recursion, and never nests interactive approvals: "
         "if an approval-required tool is requested, it stops and returns an actionable report."
     )
@@ -56,6 +58,69 @@ class SubagentRunTool:
                 },
                 "additionalProperties": False,
             },
+            "work_spec": {
+                "type": "object",
+                "description": (
+                    "WorkSpec for this delegated run. "
+                    "Used for tool gating (workspace roots, domain allowlist, allowed file types) and approval decisions."
+                ),
+                "properties": {
+                    "goal": {"type": "string", "description": "What the subagent must accomplish."},
+                    "expected_outputs": {
+                        "type": "array",
+                        "minItems": 1,
+                        "description": "Concrete files/artifacts that should be produced.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "type": {
+                                    "type": "string",
+                                    "enum": ["document", "spreadsheet", "index", "report", "other"],
+                                    "description": "Output category. Must use one of the allowed enum values (do not invent values like 'draft').",
+                                },
+                                "format": {
+                                    "type": "string",
+                                    "description": "Output format (e.g. docx, xlsx, pdf, md, json).",
+                                },
+                                "path": {
+                                    "type": "string",
+                                    "description": "Workspace-relative output path (recommended).",
+                                },
+                            },
+                            "required": ["type", "format"],
+                            "additionalProperties": True,
+                        },
+                    },
+                    "resource_scope": {
+                        "type": "object",
+                        "description": "Hard boundary for tool access (workspace/file types/domains).",
+                        "properties": {
+                            "workspace_roots": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "Allowed workspace roots (relative paths).",
+                            },
+                            "file_type_allowlist": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": (
+                                    "Optional allowlist of file extensions/types (e.g. docx, md, json). "
+                                    "If omitted or empty, file types are not restricted. "
+                                    "If set, include any intermediate artifact types you expect to write (e.g. json for plan files)."
+                                ),
+                            },
+                            "domain_allowlist": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "Allowed external domains (if any).",
+                            },
+                        },
+                        "additionalProperties": True,
+                    },
+                },
+                "required": ["goal", "expected_outputs", "resource_scope"],
+                "additionalProperties": True,
+            },
             "tool_allowlist": {
                 "type": "array",
                 "items": {"type": "string"},
@@ -69,11 +134,12 @@ class SubagentRunTool:
                 "description": "Max tool calls executed inside the subagent.",
             },
         },
-        "required": ["preset", "task"],
+        "required": ["preset", "task", "work_spec"],
         "additionalProperties": False,
     }
 
     def execute(self, *, args: dict[str, Any], project_root, context: ToolExecutionContext | None = None) -> dict[str, Any]:
+        default_max_tool_calls = 10
         preset_name = str(args.get("preset") or "").strip()
         preset = get_preset(preset_name)
         if preset is None:
@@ -101,16 +167,28 @@ class SubagentRunTool:
 
         max_tool_calls = args.get("max_tool_calls")
         if max_tool_calls is None:
-            max_tool_calls_int = preset.limits.max_tool_calls
+            max_tool_calls_int = min(preset.limits.max_tool_calls, default_max_tool_calls)
         else:
             if isinstance(max_tool_calls, bool) or not isinstance(max_tool_calls, int) or max_tool_calls < 1:
                 raise ValueError("Invalid 'max_tool_calls' (expected integer >= 1).")
             max_tool_calls_int = min(int(max_tool_calls), 200)
 
+        work_spec_raw = args.get("work_spec")
+        work_spec: WorkSpec | None = None
+        if work_spec_raw is None:
+            raise ValueError("Missing required 'work_spec'.")
+        if not isinstance(work_spec_raw, dict):
+            raise ValueError("Invalid 'work_spec' (expected object).")
+        try:
+            work_spec = WorkSpec.model_validate(work_spec_raw)
+        except Exception as e:
+            raise ValueError(f"Invalid 'work_spec': {e}") from e
+
         return run_subagent(
             preset=preset,
             task=task,
             extra_context=args.get("context"),
+            work_spec=work_spec,
             tool_allowlist=allowlist_patterns,
             max_turns=max_turns_int,
             max_tool_calls=max_tool_calls_int,

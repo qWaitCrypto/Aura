@@ -7,21 +7,16 @@ import shutil
 import sys
 from dataclasses import replace
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from . import __version__
-from .runtime.engine import Engine, EngineBuildError, build_engine_for_session
-from .runtime.event_bus import EventBus, EventFilter, EventLogAppendError
 from .runtime.ids import new_id, now_ts_ms
-from .runtime.project import RuntimePaths
-from .runtime.approval import ApprovalStatus
 from .runtime.protocol import ArtifactRef, EventKind, Op, OpKind
-from .runtime.stores import FileApprovalStore, FileArtifactStore, FileEventLogStore, FileSessionStore
-from .runtime.llm.config import ModelConfig
-from .runtime.llm.config_io import load_model_config_layers_for_dir
-from .runtime.llm.types import ModelRole
-from .runtime.skills import seed_builtin_skills
-from .runtime.tools.runtime import ToolApprovalMode
-from .runtime.validate import validate_bundle_dir, validate_project_session
+
+if TYPE_CHECKING:
+    from .runtime.engine import Engine
+    from .runtime.event_bus import EventBus
+    from .runtime.stores import FileApprovalStore, FileArtifactStore, FileEventLogStore, FileSessionStore
 
 EXIT_OK = 0
 EXIT_ERROR = 1
@@ -304,6 +299,13 @@ def _build_parser() -> argparse.ArgumentParser:
         default=30,
         help="Max model+tool turns per user message (default: 30, max: 256).",
     )
+    chat_parser.add_argument(
+        "--color",
+        dest="color",
+        choices=["auto", "always", "never"],
+        default="auto",
+        help="Color mode for console output: auto (TTY only), always, or never.",
+    )
     chat_parser.set_defaults(enable_tools=None)
     chat_parser.set_defaults(func=_cmd_chat)
 
@@ -338,6 +340,13 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         default=30,
         help="Max model+tool turns per user message (default: 30, max: 256).",
+    )
+    session_resume_parser.add_argument(
+        "--color",
+        dest="color",
+        choices=["auto", "always", "never"],
+        default="auto",
+        help="Color mode for console output: auto (TTY only), always, or never.",
     )
     session_resume_parser.set_defaults(enable_tools=None)
     session_resume_parser.set_defaults(func=_cmd_session_resume)
@@ -375,6 +384,15 @@ def _cmd_not_implemented(_: argparse.Namespace) -> int:
 
 
 def _cmd_chat(args: argparse.Namespace) -> int:
+    from .runtime.engine import EngineBuildError, build_engine_for_session
+    from .runtime.event_bus import EventBus
+    from .runtime.llm.config import ModelConfig
+    from .runtime.llm.config_io import load_model_config_layers_for_dir
+    from .runtime.llm.types import ModelRole
+    from .runtime.project import RuntimePaths
+    from .runtime.stores import FileApprovalStore, FileArtifactStore, FileEventLogStore, FileSessionStore
+    from .runtime.tools.runtime import ToolApprovalMode
+
     try:
         paths = RuntimePaths.discover()
     except FileNotFoundError as e:
@@ -510,6 +528,7 @@ def _cmd_chat(args: argparse.Namespace) -> int:
         artifact_store=artifact_store,
         timeout_s=args.timeout_s,
         print_replay=resumed,
+        color_mode=str(getattr(args, "color", "auto") or "auto"),
     )
 
 
@@ -523,6 +542,7 @@ def _run_chat_line_mode(
     artifact_store: FileArtifactStore,
     timeout_s: float | None,
     print_replay: bool,
+    color_mode: str = "auto",
 ) -> int:
     return _run_chat_console_ui(
         orchestrator=orchestrator,
@@ -533,6 +553,7 @@ def _run_chat_line_mode(
         artifact_store=artifact_store,
         timeout_s=timeout_s,
         print_replay=print_replay,
+        color_mode=color_mode,
     )
 
 
@@ -546,12 +567,15 @@ def _run_chat_console_ui(
     artifact_store: FileArtifactStore,
     timeout_s: float | None,
     print_replay: bool,
+    color_mode: str = "auto",
 ) -> int:
     from pathlib import Path
     from contextlib import contextmanager
 
+    from .runtime.event_bus import EventFilter, EventLogAppendError
     from .runtime.llm.errors import CancellationToken
     from .runtime.context_mgmt import render_context_left_line
+    from .runtime.tools.runtime import ToolApprovalMode
     from .ui.console_ui import ConsoleUI, ThinkTagParser, UIEvent, UIEventKind
 
     def _is_tty() -> bool:
@@ -625,7 +649,15 @@ def _run_chat_console_ui(
         except Exception:
             prompt_session = None
 
-    ui = ConsoleUI(stream=sys.stdout, enable_color=_is_tty())
+    cm = str(color_mode or "auto").strip().lower()
+    if cm == "never":
+        enable_color = False
+    elif cm == "always":
+        enable_color = True
+    else:
+        enable_color = _is_tty()
+
+    ui = ConsoleUI(stream=sys.stdout, enable_color=enable_color)
     ui.start()
     ui.print_header(session_id=session_id)
 
@@ -915,6 +947,8 @@ def _run_chat_console_ui(
         return modes[int(selected)][0]
 
     def _handle_pending_approvals_ui(*, request_id: str | None) -> None:
+        from .runtime.approval import ApprovalStatus
+
         def _prompt_decision(text: str) -> str:
             if prompt_session is not None:
                 try:
@@ -1205,6 +1239,8 @@ def _run_chat_console_ui(
             )
             continue
         if cmd.startswith("/model"):
+            from .runtime.llm.types import ModelRole
+
             parts = cmd.split()
             cfg = orchestrator.model_config
             current_profile_id = cfg.role_pointers.get(ModelRole.MAIN)
@@ -1461,6 +1497,9 @@ def _run_chat_basic_line_mode(
 
 
 def _cmd_session_list(_: argparse.Namespace) -> int:
+    from .runtime.project import RuntimePaths
+    from .runtime.stores import FileSessionStore
+
     try:
         paths = RuntimePaths.discover()
     except FileNotFoundError as e:
@@ -1484,11 +1523,15 @@ def _cmd_session_resume(args: argparse.Namespace) -> int:
         system_prompt=args.system_prompt,
         enable_tools=getattr(args, "enable_tools", None),
         max_tool_turns=getattr(args, "max_tool_turns", 30),
+        color=str(getattr(args, "color", "auto") or "auto"),
     )
     return _cmd_chat(args2)
 
 
 def _cmd_debug_export(args: argparse.Namespace) -> int:
+    from .runtime.project import RuntimePaths
+    from .runtime.stores import FileApprovalStore, FileArtifactStore, FileEventLogStore, FileSessionStore
+
     try:
         paths = RuntimePaths.discover()
     except FileNotFoundError as e:
@@ -1531,6 +1574,9 @@ def _cmd_debug_export(args: argparse.Namespace) -> int:
 
 
 def _cmd_debug_validate(args: argparse.Namespace) -> int:
+    from .runtime.project import RuntimePaths
+    from .runtime.validate import validate_bundle_dir, validate_project_session
+
     strict = bool(getattr(args, "strict", False))
     target = str(args.target)
     target_path = Path(target).expanduser()
@@ -1694,6 +1740,8 @@ def _runtime_event_to_ui_events(event, *, think_parser) -> list:
                     "tool": payload.get("tool_name") or "tool",
                     "call_id": payload.get("tool_call_id"),
                     "summary": payload.get("summary"),
+                    "preset": payload.get("preset"),
+                    "subagent_run_id": payload.get("subagent_run_id"),
                 },
             )
         )
@@ -1713,6 +1761,8 @@ def _runtime_event_to_ui_events(event, *, think_parser) -> list:
                     "error": payload.get("error"),
                     "details": payload.get("details") if isinstance(payload.get("details"), list) else None,
                     "ok": not bool(payload.get("error")),
+                    "preset": payload.get("preset"),
+                    "subagent_run_id": payload.get("subagent_run_id"),
                 },
             )
         )
@@ -1723,6 +1773,7 @@ def _runtime_event_to_ui_events(event, *, think_parser) -> list:
             UIEvent(
                 UIEventKind.PLAN_UPDATED,
                 {
+                    "plan_type": payload.get("plan_type"),
                     "plan": payload.get("plan") if isinstance(payload.get("plan"), list) else [],
                     "explanation": payload.get("explanation"),
                     "updated_at": payload.get("updated_at"),
@@ -1813,6 +1864,8 @@ def _handle_pending_approvals(
     timeout_s: float | None,
     request_id: str | None = None,
 ) -> None:
+    from .runtime.approval import ApprovalStatus
+
     while True:
         pending = approval_store.list(
             session_id=session_id,
@@ -1871,6 +1924,8 @@ def _handle_pending_approvals(
 
 
 def _cmd_init(args: argparse.Namespace) -> int:
+    from .runtime.skills import seed_builtin_skills
+
     project_root = Path(args.path).expanduser().resolve()
 
     if project_root.exists() and not project_root.is_dir():

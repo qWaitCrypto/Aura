@@ -28,6 +28,8 @@ class UIEventKind(str, Enum):
     TOOL_CALL_STARTED = "tool_call_started"
     TOOL_CALL_COMPLETED = "tool_call_completed"
 
+    APPROVER_EVENT = "approver_event"
+
     PLAN_UPDATED = "plan_updated"
 
     PROGRESS = "progress"
@@ -58,7 +60,10 @@ class ConsoleUI:
     def __init__(self, *, stream=None, enable_color: bool = True) -> None:
         self._stream = stream if stream is not None else sys.stdout
         self._ansi = bool(getattr(self._stream, "isatty", lambda: False)())
-        self._enable_color = enable_color and self._ansi
+        # Color output can be forced on/off independently from ANSI cursor control.
+        # `_ansi` gates in-place updates (spinner/clear-line). `--color=always` should still colorize output
+        # even when stdout isn't a TTY (e.g. logs), while `--color=never` must suppress all ANSI codes.
+        self._enable_color = bool(enable_color)
 
         self._q: "queue.Queue[UIEvent]" = queue.Queue()
         self._stop = threading.Event()
@@ -79,9 +84,18 @@ class ConsoleUI:
         self._printed_think_preview = False
         self._spinner_label = "Thinking"
 
+        # Tool-level waiting (for long-running tools like browser__run/subagent__run).
+        self._waiting_for_tool = False
+        self._tool_spinner_frame = 0
+        self._tool_last_spinner_paint = 0.0
+        self._tool_plain_waiting_printed = False
+        self._tool_started_at = 0.0
+        self._tool_spinner_label = "Running"
+
         # Tool log buffering (Codex/Goose-style): group tool calls into a compact block
         # and flush before the next LLM request starts.
-        self._pending_tool_items: list[tuple[str, str]] = []
+        # Each item is (category, line, count). Consecutive duplicates are folded (×N).
+        self._pending_tool_items: list[tuple[str, str, int]] = []
         self._pending_tool_omitted = 0
 
         # Interop with full-screen terminal UIs (e.g. prompt_toolkit dialogs).
@@ -144,6 +158,8 @@ class ConsoleUI:
             return "Edited"
         if tool_name == "update_plan":
             return "Planned"
+        if tool_name == "update_todo":
+            return "Todo"
         if tool_name.startswith("spec__"):
             return "Spec"
         if tool_name == "session__export":
@@ -153,7 +169,13 @@ class ConsoleUI:
         return "Tools"
 
     def _queue_tool_item(self, *, category: str, line: str) -> None:
-        self._pending_tool_items.append((category, line))
+        if self._pending_tool_items:
+            prev_cat, prev_line, prev_count = self._pending_tool_items[-1]
+            if prev_cat == category and prev_line == line:
+                self._pending_tool_items[-1] = (prev_cat, prev_line, prev_count + 1)
+                return
+
+        self._pending_tool_items.append((category, line, 1))
         max_items = 40
         if len(self._pending_tool_items) > max_items:
             self._pending_tool_items = self._pending_tool_items[-max_items:]
@@ -164,19 +186,29 @@ class ConsoleUI:
             return
         self._ensure_newline_if_streaming()
 
-        order = ["Explored", "Edited", "Planned", "Spec", "Ran", "Tools"]
-        groups: dict[str, list[str]] = {}
-        for cat, line in self._pending_tool_items:
-            groups.setdefault(cat, []).append(line)
+        order = ["Explored", "Edited", "Planned", "Todo", "Spec", "Ran", "Tools"]
+        groups: dict[str, list[tuple[str, int]]] = {}
+        for cat, line, count in self._pending_tool_items:
+            groups.setdefault(cat, []).append((line, count))
 
         for cat in order:
             lines = groups.get(cat)
             if not lines:
                 continue
-            self._println_dim(f"• {cat}")
-            for i, line in enumerate(lines):
+            color_code = {
+                "Explored": "1;34",
+                "Edited": "1;36",
+                "Planned": "1;35",
+                "Todo": "1;35",
+                "Spec": "1;34",
+                "Ran": "1;32",
+                "Tools": "1;37",
+            }.get(cat, "1;37")
+            self._println(self._color(f"• {cat}", color_code))
+            for i, (line, count) in enumerate(lines):
                 prefix = "  └ " if i == 0 else "    "
-                self._println_dim(prefix + line)
+                suffix = f" ×{count}" if count > 1 else ""
+                self._println(prefix + line + suffix)
 
         if self._pending_tool_omitted:
             self._println_dim(f"  ... ({self._pending_tool_omitted} earlier tool events omitted)")
@@ -275,15 +307,21 @@ class ConsoleUI:
             pass
 
     def _tick(self) -> None:
-        if not self._waiting_for_llm:
-            return
         if not self._ansi:
             return
         now = time.monotonic()
-        if (now - self._last_spinner_paint) < 0.06:
+        if self._waiting_for_llm:
+            if (now - self._last_spinner_paint) < 0.06:
+                return
+            self._last_spinner_paint = now
+            self._paint_spinner()
             return
-        self._last_spinner_paint = now
-        self._paint_spinner()
+        if self._waiting_for_tool:
+            if (now - self._tool_last_spinner_paint) < 0.06:
+                return
+            self._tool_last_spinner_paint = now
+            self._paint_tool_spinner()
+            return
 
     def _handle_event(self, ev: UIEvent) -> None:
         k = ev.kind
@@ -313,6 +351,7 @@ class ConsoleUI:
             return
 
         if k is UIEventKind.LLM_REQUEST_STARTED:
+            self._stop_waiting(clear_line=True)
             # Flush previous tool block (if any) before starting the next LLM request.
             self._flush_tool_items()
             self._waiting_for_llm = True
@@ -380,10 +419,29 @@ class ConsoleUI:
             return
 
         if k is UIEventKind.TOOL_CALL_STARTED:
-            # Tool calls are summarized on completion and flushed as a grouped block.
+            preset = p.get("preset")
+            if isinstance(preset, str) and preset.strip():
+                self._stop_waiting(clear_line=True)
+                self._ensure_newline_if_streaming()
+                tool = str(p.get("tool", "tool"))
+                summary = str(p.get("summary") or tool)
+                self._println_dim(self._format_badge("RUN", "36") + f" ↳ [{preset.strip()}] {summary} (started)")
+                return
+            # Main-agent tool calls are normally summarized on completion and flushed as a grouped block.
+            # For longer-running tools, emit a lightweight "started" line so the UI doesn't feel stuck.
+            tool = str(p.get("tool", "tool"))
+            summary = str(p.get("summary") or tool)
+            show_started = tool in {"subagent__run", "browser__run", "snapshot__create"} or summary.startswith("Browser:") or summary.startswith("Subagent:")
+            if show_started:
+                self._stop_waiting(clear_line=True)
+                self._ensure_newline_if_streaming()
+                self._println_dim(self._format_badge("RUN", "36") + f" ↳ {summary} (started)")
+                self._start_tool_waiting(label=summary)
+                return
             return
 
         if k is UIEventKind.TOOL_CALL_COMPLETED:
+            self._stop_waiting(clear_line=True)
             tool = str(p.get("tool", "tool"))
             summary = str(p.get("summary") or tool)
             status = str(p.get("status") or ("succeeded" if bool(p.get("ok", True)) else "failed"))
@@ -391,6 +449,8 @@ class ConsoleUI:
             error_code = p.get("error_code")
             error = p.get("error")
             details = p.get("details")
+            preset = p.get("preset")
+            ok = bool(p.get("ok", True))
 
             suffix_parts: list[str] = []
             if isinstance(duration_ms, int) and duration_ms >= 500:
@@ -416,8 +476,25 @@ class ConsoleUI:
 
             category = self._tool_category(tool)
             suppress_summary = tool in {"project__apply_patch", "project__patch"} and isinstance(details, list) and details
+            badge = self._tool_status_badge(status=status, error_code=error_code, error=error, ok=ok)
+            if isinstance(preset, str) and preset.strip():
+                # Subagent progress: print tool completions immediately instead of buffering until the next LLM request.
+                self._stop_waiting(clear_line=True)
+                self._ensure_newline_if_streaming()
+                prefix = f"↳ [{preset.strip()}] "
+                if not suppress_summary:
+                    self._println_dim(badge + " " + prefix + summary + suffix)
+                if isinstance(details, list):
+                    for item in details:
+                        if not isinstance(item, str):
+                            continue
+                        s = item.rstrip("\r\n")
+                        if s.strip():
+                            self._println_dim(prefix + self._maybe_color_diff_preview_line(s))
+                return
+
             if not suppress_summary:
-                self._queue_tool_item(category=category, line=summary + suffix)
+                self._queue_tool_item(category=category, line=badge + " " + summary + suffix)
             if isinstance(details, list):
                 for item in details:
                     if not isinstance(item, str):
@@ -427,14 +504,33 @@ class ConsoleUI:
                         self._queue_tool_item(category=category, line=self._maybe_color_diff_preview_line(s))
             return
 
+        if k is UIEventKind.APPROVER_EVENT:
+            self._stop_waiting(clear_line=True)
+            self._ensure_newline_if_streaming()
+            preset = p.get("preset")
+            msg = str(p.get("message", "") or "")
+            if not msg:
+                return
+            if isinstance(preset, str) and preset.strip():
+                self._println(self._color(f"↳ [{preset.strip()}] {msg}", "35"))
+            else:
+                self._println(self._color(f"↳ {msg}", "35"))
+            return
+
         if k is UIEventKind.PLAN_UPDATED:
             self._stop_waiting(clear_line=True)
             self._ensure_newline_if_streaming()
 
             explanation = str(p.get("explanation") or "").strip()
             raw_plan = p.get("plan")
+            plan_type = str(p.get("plan_type") or "").strip().lower()
 
-            self._println_dim("[plan] Updated plan")
+            if plan_type == "todo":
+                self._println(self._color("[todo] Updated todo", "1;35"))
+            elif plan_type == "dag":
+                self._println(self._color("[dag] Updated DAG plan", "1;36"))
+            else:
+                self._println(self._color("[plan] Updated plan", "1;35"))
             if explanation:
                 one_line = " ".join(explanation.splitlines()).strip()
                 if one_line:
@@ -455,16 +551,24 @@ class ConsoleUI:
                 status = str(item.get("status") or "").strip()
                 if not step or not status:
                     continue
+                item_id = str(item.get("id") or "").strip()
+                deps = item.get("depends_on")
+                deps_list = [str(d).strip() for d in deps if isinstance(d, str) and str(d).strip()] if isinstance(deps, list) else []
+                if plan_type == "dag":
+                    dep_suffix = f" <- {', '.join(deps_list)}" if deps_list else ""
+                    prefix_text = f"{item_id or '?'}{dep_suffix}: "
+                else:
+                    prefix_text = ""
 
                 if status == "completed":
                     prefix = "[x]"
-                    self._println_dim(f"  {prefix} {step}")
+                    self._println(self._color(f"  {prefix} {prefix_text}{step}", "32"))
                 elif status == "in_progress":
                     prefix = "[~]"
-                    self._println(self._color(f"  {prefix} {step}", "1;36"))
+                    self._println(self._color(f"  {prefix} {prefix_text}{step}", "1;36"))
                 else:
                     prefix = "[ ]"
-                    self._println_dim(f"  {prefix} {step}")
+                    self._println_dim(f"  {prefix} {prefix_text}{step}")
                 shown += 1
 
             remaining = len([x for x in raw_plan if isinstance(x, dict)]) - shown
@@ -532,6 +636,25 @@ class ConsoleUI:
             return s
         return f"\x1b[{code}m{s}\x1b[0m"
 
+    def _format_badge(self, text: str, color_code: str) -> str:
+        raw = f"[{text}]"
+        return self._color(raw, f"1;{color_code}")
+
+    def _tool_status_badge(self, *, status: str, error_code: object, error: object, ok: bool) -> str:
+        st = str(status or "").strip().lower()
+        code = str(error_code or "").strip().lower()
+        err = str(error or "").strip()
+
+        if code == "cancelled" and err == "Approval denied.":
+            return self._format_badge("DENIED", "33")
+        if st in {"needs_approval", "require_approval"} or code in {"needs_approval", "require_approval"}:
+            return self._format_badge("APPROVAL", "35")
+        if st == "cancelled" or code == "cancelled":
+            return self._format_badge("CANCELLED", "33")
+        if ok:
+            return self._format_badge("OK", "32")
+        return self._format_badge("FAILED", "31")
+
     def _write(self, s: str) -> None:
         with self._io_lock:
             self._stream.write(s)
@@ -593,10 +716,14 @@ class ConsoleUI:
         return "".join(out)
 
     def _stop_waiting(self, *, clear_line: bool) -> None:
-        if not self._waiting_for_llm:
-            return
-        self._waiting_for_llm = False
-        if clear_line:
+        stopped = False
+        if self._waiting_for_llm:
+            self._waiting_for_llm = False
+            stopped = True
+        if self._waiting_for_tool:
+            self._waiting_for_tool = False
+            stopped = True
+        if clear_line and stopped:
             self._clear_spinner_line()
 
     def _clear_spinner_line(self) -> None:
@@ -637,6 +764,43 @@ class ConsoleUI:
         line = self._truncate_to_width(line, max_cols)
         # Paint in-place.
         self._write("\r\x1b[2K\r" + line)
+
+    def _paint_tool_spinner(self) -> None:
+        if not self._waiting_for_tool:
+            return
+        if not self._ansi:
+            if not self._tool_plain_waiting_printed:
+                self._println_dim(f"{self._tool_spinner_label}…")
+                self._tool_plain_waiting_printed = True
+            return
+
+        frames: Sequence[str] = ("◌", "◍", "●", "◍")
+        ch = frames[self._tool_spinner_frame % len(frames)]
+        self._tool_spinner_frame += 1
+
+        elapsed_s = max(0.0, time.monotonic() - self._tool_started_at)
+        elapsed = f"{int(elapsed_s)}s"
+
+        cols = shutil.get_terminal_size((80, 20)).columns
+        max_cols = max(20, int(cols) - 1)
+
+        line = f"{ch} {self._tool_spinner_label} ({elapsed})"
+        line = self._truncate_to_width(line, max_cols)
+        self._write("\r\x1b[2K\r" + line)
+
+    def _start_tool_waiting(self, *, label: str) -> None:
+        self._waiting_for_tool = True
+        self._tool_spinner_frame = 0
+        self._tool_last_spinner_paint = 0.0
+        self._tool_plain_waiting_printed = False
+        self._tool_started_at = time.monotonic()
+
+        cols = shutil.get_terminal_size((80, 20)).columns
+        max_cols = max(20, int(cols) - 1)
+        # Reserve space for spinner + elapsed.
+        label_width = max(10, min(60, max_cols - 12))
+        self._tool_spinner_label = self._elide_tail(str(label).strip(), label_width)
+        self._paint_tool_spinner()
 
     def _display_width(self, s: str) -> int:
         w = 0

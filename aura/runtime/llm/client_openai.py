@@ -57,6 +57,15 @@ def _openai_to_response(*, profile_id: str, resp: Any) -> LLMResponse:
         usage=_openai_to_usage(resp),
         stop_reason=getattr(choice0, "finish_reason", None),
         request_id=getattr(resp, "id", None),
+        thinking=(
+            str(thinking)
+            if (
+                (thinking := (getattr(msg, "reasoning_content", None) or getattr(msg, "reasoning", None)))
+                and isinstance(thinking, str)
+                and thinking.strip()
+            )
+            else None
+        ),
     )
 
 
@@ -70,6 +79,7 @@ def _openai_stream_to_events(
 ) -> Iterator[LLMStreamEvent]:
     text_parts: list[str] = []
     tool_builders: dict[int, _OpenAIToolCallBuilder] = {}
+    accumulated_thinking = ""
     stop_reason: str | None = None
     request_id: str | None = None
     model: str | None = None
@@ -108,7 +118,15 @@ def _openai_stream_to_events(
             if reasoning_delta is None:
                 reasoning_delta = getattr(delta, "reasoning", None)
             if reasoning_delta:
-                yield LLMStreamEvent(kind=LLMStreamEventKind.THINKING_DELTA, thinking_delta=str(reasoning_delta))
+                thinking_text = str(reasoning_delta)
+                if accumulated_thinking and thinking_text.startswith(accumulated_thinking):
+                    delta_text = thinking_text[len(accumulated_thinking) :]
+                    accumulated_thinking = thinking_text
+                else:
+                    delta_text = thinking_text
+                    accumulated_thinking += thinking_text
+                if delta_text:
+                    yield LLMStreamEvent(kind=LLMStreamEventKind.THINKING_DELTA, thinking_delta=delta_text)
 
             content_delta = getattr(delta, "content", None)
             if content_delta:
@@ -161,6 +179,6 @@ def _openai_stream_to_events(
         usage=usage,
         stop_reason=stop_reason or ("timeout" if (timeout_flag is not None and timeout_flag.is_set()) else None),
         request_id=request_id,
+        thinking=(accumulated_thinking if (tool_calls and accumulated_thinking.strip()) else None),
     )
     yield LLMStreamEvent(kind=LLMStreamEventKind.COMPLETED, response=response)
-
