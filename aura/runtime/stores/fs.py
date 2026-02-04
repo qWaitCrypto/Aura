@@ -106,6 +106,13 @@ class FileArtifactStore(ArtifactStore):
     def __init__(self, root: Path) -> None:
         self._root = root
         self._root.mkdir(parents=True, exist_ok=True)
+        self._root_resolved = self._root.resolve()
+
+    def _resolve_locator(self, locator: str) -> Path:
+        path = (self._root / locator).resolve()
+        if path != self._root_resolved and self._root_resolved not in path.parents:
+            raise ValueError(f"Artifact locator escapes root: {locator}")
+        return path
 
     def put(self, content: str | bytes, *, kind: str, meta: dict[str, Any] | None = None) -> ArtifactRef:
         if isinstance(content, str):
@@ -133,13 +140,13 @@ class FileArtifactStore(ArtifactStore):
         return self.open_locator(artifact_ref.locator)
 
     def open_locator(self, locator: str) -> bytes:
-        path = (self._root / locator).resolve()
+        path = self._resolve_locator(locator)
         if not path.is_file():
             raise FileNotFoundError(f"Artifact not found: {locator}")
         return path.read_bytes()
 
     def resolve_path(self, artifact_ref: ArtifactRef) -> Path:
-        return (self._root / artifact_ref.locator).resolve()
+        return self._resolve_locator(artifact_ref.locator)
 
     def prune(self, policy: dict[str, Any] | None = None) -> dict[str, Any]:
         return {"deleted": 0, "policy": dict(policy or {})}
@@ -167,7 +174,7 @@ class FileEventLogStore(EventLogStore):
         if not path.exists():
             return iter(())
         seen_anchor = since_event_id is None
-        with path.open("r", encoding="utf-8") as f:
+        with path.open("r", encoding="utf-8", errors="replace") as f:
             for line in f:
                 line = line.strip()
                 if not line:
@@ -176,7 +183,10 @@ class FileEventLogStore(EventLogStore):
                     raw = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                event = Event.from_dict(raw)
+                try:
+                    event = Event.from_dict(raw)
+                except Exception:
+                    continue
                 if not seen_anchor:
                     if event.event_id == since_event_id:
                         seen_anchor = True
@@ -201,7 +211,10 @@ class FileEventLogStore(EventLogStore):
         artifacts_dir = bundle_dir / "artifacts"
         artifacts_dir.mkdir(parents=True, exist_ok=True)
         for ref in artifact_refs:
-            src = self._artifact_store.resolve_path(ref)
+            try:
+                src = self._artifact_store.resolve_path(ref)
+            except ValueError:
+                continue
             if src.exists() and src.is_file():
                 shutil.copyfile(src, artifacts_dir / Path(ref.locator).name)
 

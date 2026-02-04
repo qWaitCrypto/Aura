@@ -24,6 +24,8 @@ EXIT_DENIED = 2
 EXIT_VALIDATION_FAILED = 3
 EXIT_TOOL_FAILED = 4
 EXIT_CONFIG_ERROR = 5
+DEFAULT_MAX_TOOL_TURNS = 30
+MAX_TOOL_TURNS_LIMIT = 256
 
 
 def _pick_from_list_standalone(
@@ -296,8 +298,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--max-tool-turns",
         dest="max_tool_turns",
         type=int,
-        default=30,
-        help="Max model+tool turns per user message (default: 30, max: 256).",
+        default=DEFAULT_MAX_TOOL_TURNS,
+        help=(
+            "Max model+tool turns per user message "
+            f"(default: {DEFAULT_MAX_TOOL_TURNS}, max: {MAX_TOOL_TURNS_LIMIT})."
+        ),
     )
     chat_parser.add_argument(
         "--color",
@@ -338,8 +343,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--max-tool-turns",
         dest="max_tool_turns",
         type=int,
-        default=30,
-        help="Max model+tool turns per user message (default: 30, max: 256).",
+        default=DEFAULT_MAX_TOOL_TURNS,
+        help=(
+            "Max model+tool turns per user message "
+            f"(default: {DEFAULT_MAX_TOOL_TURNS}, max: {MAX_TOOL_TURNS_LIMIT})."
+        ),
     )
     session_resume_parser.add_argument(
         "--color",
@@ -383,6 +391,30 @@ def _cmd_not_implemented(_: argparse.Namespace) -> int:
     return EXIT_ERROR
 
 
+def _normalize_timeout_s(value: float | None) -> float | None:
+    if value is None:
+        return None
+    try:
+        timeout_s = float(value)
+    except (TypeError, ValueError) as e:
+        raise ValueError(f"timeout must be a number, got {value!r}") from e
+    if timeout_s <= 0:
+        raise ValueError("timeout must be greater than 0 seconds")
+    return timeout_s
+
+
+def _normalize_max_tool_turns(value: int | None) -> int:
+    try:
+        max_tool_turns = DEFAULT_MAX_TOOL_TURNS if value is None else int(value)
+    except (TypeError, ValueError) as e:
+        raise ValueError(f"max_tool_turns must be an integer, got {value!r}") from e
+    if max_tool_turns < 1:
+        raise ValueError("max_tool_turns must be >= 1")
+    if max_tool_turns > MAX_TOOL_TURNS_LIMIT:
+        raise ValueError(f"max_tool_turns must be <= {MAX_TOOL_TURNS_LIMIT}")
+    return max_tool_turns
+
+
 def _cmd_chat(args: argparse.Namespace) -> int:
     from .runtime.engine import EngineBuildError, build_engine_for_session
     from .runtime.event_bus import EventBus
@@ -392,6 +424,13 @@ def _cmd_chat(args: argparse.Namespace) -> int:
     from .runtime.project import RuntimePaths
     from .runtime.stores import FileApprovalStore, FileArtifactStore, FileEventLogStore, FileSessionStore
     from .runtime.tools.runtime import ToolApprovalMode
+
+    try:
+        timeout_s = _normalize_timeout_s(args.timeout_s)
+        max_tool_turns = _normalize_max_tool_turns(args.max_tool_turns)
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return EXIT_ERROR
 
     try:
         paths = RuntimePaths.discover()
@@ -497,7 +536,7 @@ def _cmd_chat(args: argparse.Namespace) -> int:
             model_config=model_config,
             system_prompt=args.system_prompt,
             tools_enabled=bool(enable_tools),
-            max_tool_turns=args.max_tool_turns,
+            max_tool_turns=max_tool_turns,
         )
     except EngineBuildError as e:
         print(str(e), file=sys.stderr)
@@ -526,7 +565,7 @@ def _cmd_chat(args: argparse.Namespace) -> int:
         approval_store=approval_store,
         event_log_store=event_log_store,
         artifact_store=artifact_store,
-        timeout_s=args.timeout_s,
+        timeout_s=timeout_s,
         print_replay=resumed,
         color_mode=str(getattr(args, "color", "auto") or "auto"),
     )
@@ -1522,7 +1561,7 @@ def _cmd_session_resume(args: argparse.Namespace) -> int:
         timeout_s=args.timeout_s,
         system_prompt=args.system_prompt,
         enable_tools=getattr(args, "enable_tools", None),
-        max_tool_turns=getattr(args, "max_tool_turns", 30),
+        max_tool_turns=getattr(args, "max_tool_turns", DEFAULT_MAX_TOOL_TURNS),
         color=str(getattr(args, "color", "auto") or "auto"),
     )
     return _cmd_chat(args2)
