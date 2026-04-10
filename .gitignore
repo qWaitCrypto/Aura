@@ -1,0 +1,32 @@
+# Local assistant and planning artifacts
+AGENTS.md
+/openspec/
+/references/
+
+# Aura runtime state
+.aura/
+
+# Python caches and build outputs
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Editors and local tooling
+.idea/
+.vscode/
+.codex
+.DS_Store

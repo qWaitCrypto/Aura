@@ -1,259 +1,115 @@
 # Aura
 
-**A developer-experience-first AI agent framework for building controllable, auditable agents.**
+[![CI](https://github.com/qWaitCrypto/Aura/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/qWaitCrypto/Aura/actions/workflows/ci.yml)
+[![Python](https://img.shields.io/badge/python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![License](https://img.shields.io/github/license/qWaitCrypto/Aura)](LICENSE)
+[![Stars](https://img.shields.io/github/stars/qWaitCrypto/Aura?style=social)](https://github.com/qWaitCrypto/Aura)
 
-Aura originated from [Novelaire](https://github.com/qWaitCrypto/novelaire), a creative writing assistant, and evolved into a general-purpose agent platform. It is now powered by [Agno](https://github.com/agno-ai/agno), combining Agno's multi-model orchestration with Aura's focus on transparency, version control, and local-first workflows.
+Aura is a local-first AI agent framework for developers who want **approval-gated execution, auditable state, and resumable workflows** without giving up modern tool calling or model flexibility.
 
----
+Built on top of [Agno](https://github.com/agno-ai/agno), Aura focuses on the part most agent demos skip: making agent behavior inspectable, replayable, and safe enough to use in real project directories.
 
-## Why Aura?
+## Why Aura stands out
 
-While many agent frameworks focus on ease-of-use or cloud integration, **Aura prioritizes developer control**:
+- **Local-first project state**: sessions, runs, approvals, and artifacts live under `.aura/`, so workflows stay versionable and reproducible.
+- **Approval gates for risky tools**: read-only operations can flow fast, while shell or sensitive actions stop for explicit approval.
+- **Append-only audit trail**: every model response, tool call, and approval event is persisted as JSONL for replay and debugging.
+- **Resumable runs**: interrupted tool loops can pause to disk and continue later, including cross-process recovery.
+- **Multi-surface runtime**: the same engine can back a CLI today and web, cloud, or editor surfaces later.
+- **Extensible orchestration layer**: built-in tools, MCP servers, skills, DAG execution, and delegated subagents share one runtime model.
 
-- **Audit Trails**: Every event (LLM calls, tool executions, approvals) logged to `.aura/events/` as append-only JSONL
-- **Project-as-Code**: Agent state lives in `.aura/` — committed to git, sharable, reproducible
-- **Approval Policies**: Fine-grained control over tool execution with inspection, approval, and denial workflows
-- **Multi-Surface**: Same engine powers CLI, Web, Plugin, or Cloud deployments via a simple `Surface` protocol
-- **Cross-Process Recovery**: Pause/resume workflows across machine restarts using run snapshots
+## Architecture
 
----
+```mermaid
+flowchart LR
+    Dev((Developer)) --> CLI["CLI surface<br/>aura/cli.py"]
+    Dev --> Future["Future surfaces<br/>web / cloud / plugin"]
 
-## Quick Start
+    CLI --> Engine["Async runtime engine<br/>aura/runtime/engine_agno_async.py"]
+    Future --> Engine
+
+    Engine --> Router["Model router + provider adapters"]
+    Engine --> Tools["Tool runtime<br/>built-ins / MCP / DAG / subagents"]
+    Engine --> Approval["Approval policy + inspection"]
+    Engine --> Storage["Session, artifact, event stores"]
+
+    Tools --> Workspace["Project workspace"]
+    Approval --> Runs[".aura/runs/"]
+    Storage --> Sessions[".aura/sessions/"]
+    Storage --> Events[".aura/events/*.jsonl"]
+    Storage --> Artifacts[".aura/artifacts/"]
+```
+
+## Quick start
 
 ```bash
-# Clone the repository
-git clone https://github.com/qWaitCrypto/aura.git
-cd aura
+git clone https://github.com/qWaitCrypto/Aura.git
+cd Aura
 
-# Initialize Aura in your workspace
-aura init .
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -e ".[dev]"
 
-# Start a chat session
+aura init demo-workspace
+```
+
+Edit `demo-workspace/.aura/config/models.json` and set the provider credentials and model you want to use, then start a session:
+
+```bash
+cd demo-workspace
 aura chat
 ```
 
-> **Note**: `.aura/` is created in your **workspace**, not in the Aura repository. This keeps your project state separate from the framework code.
+Run the integration suite:
 
----
-
-## Core Concepts
-
-### 1. **Session & Events**
-Every conversation is a session stored in `.aura/sessions/<session_id>.json`. All events (requests, responses, tool calls) append to `.aura/events/<session_id>.jsonl`.
-
-### 2. **Tools & Approval**
-Aura ships with built-in tools (file operations, shell, web, specs, skills). Each tool call can be:
-- **Auto-approved** (low-risk, like reading files)
-- **Require approval** (high-risk, like shell commands)
-- **Denied** (policy violations)
-
-### 3. **Skills**
-Reusable capabilities defined as markdown files in `.aura/skills/`. Skills combine instructions with optional tool allowlists.
-
-```markdown
----
-name: code-review
-description: Automated code review with security checks
-allowed_tools:
-  - project__read_text
-  - project__search_text
----
-# Instructions
-...
+```bash
+python -m pytest -q -p no:cacheprovider scripts/integration
 ```
 
-### 4. **Subagents**
-Delegate subtasks to isolated agents with scoped tool access and guardrails (max turns, max tool calls).
+## Core capabilities
 
-### 5. **Compaction**
-Automatically summarize long conversations when context approaches limits, preserving memory while trimming history.
+| Capability | What Aura adds |
+| --- | --- |
+| Tool execution | Approval-aware execution, inspection previews, and persisted tool results |
+| Session memory | Event replay, compaction, and resumable runs stored on disk |
+| Multi-model routing | OpenAI-compatible, OpenAI Codex, Anthropic, and Gemini adapters |
+| Delegation | Subagents and DAG-based work orchestration with approval passthrough |
+| Extensibility | Skills, MCP integration, optional knowledge retrieval, surface abstraction |
 
-### 6. **MCP Integration**
-Support for [Model Context Protocol](https://modelcontextprotocol.io/) servers via `.aura/config/mcp.json`.
+## Repository layout
 
-### 7. **RAG (Optional)**
-Project knowledge retrieval using BM25, embeddings, or hybrid search. Disabled by default; opt-in via configuration.
+```text
+aura/
+├── cli.py                     # CLI entry point
+├── runtime/                   # Engine, routing, tools, storage, orchestration
+├── surfaces/                  # Surface stubs for future web/cloud adapters
+└── ui/                        # Console rendering
 
----
-
-## Multi-Surface Architecture
-
-Aura's engine is surface-agnostic. The same runtime can power:
-
-- **CLI**: `aura chat` (current implementation)
-- **Web**: FastAPI + WebSocket (stub provided)
-- **Cloud**: Stateless REST API with cross-process recovery (stub provided)
-- **Plugin**: VS Code / Cursor extensions (future)
-
-See `aura/runtime/surface.py` for the interface.
-
----
-
-## Architecture Overview
-
-This diagram highlights Aura’s core flow: **runtime engine + multi-surface entrypoints + auditable toolchain + project state storage**. It maps both the repository layout and the `.aura/` workspace layout to make module boundaries and data paths easy to locate.
-
-```mermaid
-flowchart TD
-    User((Developer)) --> CLI[aura/cli.py]
-    User --> Web[Future Web UI]
-    User --> Plugin[IDE Plugin]
-
-    CLI --> Surface[surfaces/*]
-    Web --> Surface
-    Plugin --> Surface
-
-    Surface --> Engine[aura/runtime/engine_agno_async.py]
-
-    Engine --> Tools[aura/runtime/tools/*]
-    Engine --> Skills[aura/runtime/skills.py]
-    Engine --> Subagents[aura/runtime/subagents/*]
-    Engine --> MCP[aura/runtime/mcp/*]
-    Engine --> Knowledge[aura/runtime/knowledge/*]
-    Engine --> Approval[Approval Policies]
-
-    Tools --> FS[File/Shell/Web tools]
-    Tools --> Spec[Spec/Skill tools]
-
-    Approval --> Events[.aura/events/*.jsonl]
-    Engine --> Sessions[.aura/sessions/*.json]
-    Engine --> Runs[.aura/runs/*]
-    Skills --> SkillStore[.aura/skills/*]
-    Knowledge --> KB[.aura/knowledge/*]
-    Knowledge --> VectorDB[.aura/vectordb/*]
-    MCP --> MCPConfig[.aura/config/mcp.json]
-
-    Events --> Audit[Append-only audit trail]
-    Sessions --> Replay[Session replay & compaction]
+scripts/
+├── integration/               # Integration tests
+├── mcp_smoke_server.py        # Local MCP smoke server
+├── mcp_smoke_client.py        # MCP smoke client
+└── smoke_agno_engine.py       # End-to-end smoke runner
 ```
 
----
+## Development
 
-## Directory Structure
+See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, testing, and commit conventions.
 
-### Your Workspace (created by `aura init`)
+## Project status
 
-```
-<your-workspace>/
-└── .aura/
-    ├── config/
-    │   └── mcp.json        # MCP server configs
-    ├── sessions/           # Chat sessions
-    ├── events/             # Event logs (JSONL)
-    ├── runs/               # Paused run snapshots
-    ├── skills/             # Loaded skills
-    ├── knowledge/          # RAG documents (optional)
-    └── vectordb/           # Vector DB storage (optional)
-```
+Aura is currently **CLI-first and actively evolving**. The runtime already includes:
 
-### Aura Repository
+- async tool loops
+- approval-aware execution
+- MCP tool loading
+- resumable runs
+- delegated subagents
+- DAG execution primitives
 
-```
-aura/                       # Framework code
-├── runtime/
-│   ├── engine_agno_async.py  # Async-first engine
-│   ├── tools/                # Built-in tools
-│   ├── subagents/            # Subagent runner
-│   ├── skills.py             # Skill store
-│   ├── knowledge/            # RAG module
-│   └── mcp/                  # MCP integration
-├── surfaces/               # Surface implementations
-└── cli.py                  # CLI entry point
-```
-
----
-
-## How Aura Extends Agno
-
-| Feature | Agno Provides | Aura Adds |
-|---------|---------------|-----------|
-| **Multi-model orchestration** | ✅ Agent, Tools, Knowledge | File-based state (`.aura/`), audit trails |
-| **Tool execution** | ✅ Function calling | Approval policies, inspection, deny rules |
-| **Memory** | ✅ `AgentMemory` | Explicit compaction, session snapshots |
-| **MCP** | ✅ `MCPTools` | Config-driven server management |
-| **Skills** | ✅ `LocalSkills` | Project-local skill store, nested categories |
-| **RAG** | ✅ `Knowledge` | Opt-in, offline BM25, pluggable backends |
-| **Subagents** | ✅ Multi-agent (Team) | Single-agent isolation with approval bypass prevention |
-
----
-
-## Development Status
-
-**Current**: v0.2 (Agno-powered, fully async)
-
-Recent milestones:
-- ✅ Migrated to Agno runtime (from custom engine)
-- ✅ Async-first engine with pause/resume
-- ✅ Cross-process run recovery
-- ✅ MCP integration
-- ✅ Optional RAG module
-- ✅ Multi-surface abstraction
-- ✅ Integration tests (9/10 passing)
-
----
-
-## Philosophy
-
-**Aura is designed for developers building AI agents, not for end-users chatting with AI.**
-
-We believe:
-- **Transparency over magic**: Every decision is logged and reviewable
-- **Local-first**: Your data lives in git, not a cloud database
-- **Deliberate control**: Agents should require approval for risky actions
-- **Composability**: Skills, tools, and surfaces are building blocks, not black boxes
-
----
-
-## Origins
-
-Aura started as the runtime for **Novelaire**, a creative writing assistant. As we extracted the agent logic from domain-specific features, we recognized the need for a general-purpose framework that preserved the audit trails, approval workflows, and project-centric design that made Novelaire reliable.
-
-After evaluating existing frameworks, we chose to build on **Agno** for its strong multi-model support and extensibility, while preserving Aura's unique DX philosophy.
-
----
-
-## Contributing
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup and guidelines.
-
----
+The main focus now is polishing the open-source surface area: packaging, CI, docs, and contributor ergonomics.
 
 ## License
 
 [MIT](LICENSE)
-
----
-
-## Keywords for Discoverability
-
-To help people find Aura:
-
-**GitHub Topics** (add to repo settings):
-- `ai-agent`
-- `llm-framework`
-- `agno`
-- `developer-tools`
-- `local-first`
-- `audit-trail`
-- `mcp`
-- `rag`
-- `multi-agent`
-- `python-agent`
-
-**README Keywords** (already embedded above):
-- AI agent framework
-- LLM orchestration
-- Developer-first agent
-- Audit trail
-- Project-as-code
-- Approval workflow
-- Multi-surface agent
-- Local-first AI
-- Cross-process recovery
-- Model Context Protocol
-
-**Social/SEO**:
-- Blog post: "Building Transparent AI Agents with Aura"
-- Reddit: r/LocalLLaMA, r/MachineLearning
-- Hacker News: "Show HN: Aura – Developer-first AI agent framework"
-- Twitter/X: Tag #AI, #LLM, #AgentFramework, #LocalFirst

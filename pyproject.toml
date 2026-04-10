@@ -1,0 +1,85 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aura"
+dynamic = ["version"]
+description = "Local-first AI agent runtime with approval gates, auditable events, and resumable multi-surface workflows."
+readme = { file = "README.md", content-type = "text/markdown" }
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+  { name = "qWaitCrypto" },
+]
+keywords = [
+  "ai-agent",
+  "agent-framework",
+  "audit-trail",
+  "developer-tools",
+  "llm",
+  "local-first",
+  "mcp",
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Software Development :: Libraries",
+  "Topic :: Software Development :: Libraries :: Python Modules",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+  "agno>=2.3.26",
+  "anthropic>=0.75.0",
+  "httpx>=0.28.1",
+  "mcp>=1.12.4",
+  "openai>=1.100.2",
+  "prompt-toolkit>=3.0.51",
+  "pydantic>=2.10.3",
+  "strictyaml>=1.7.3",
+]
+
+[project.optional-dependencies]
+dev = [
+  "build>=1.4.0",
+  "pytest>=8.4.2",
+  "pytest-asyncio>=1.2.0",
+]
+aigc = [
+  "torch",
+  "torchvision",
+  "transformers",
+]
+
+[project.scripts]
+aura = "aura.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/qWaitCrypto/Aura"
+Repository = "https://github.com/qWaitCrypto/Aura"
+Issues = "https://github.com/qWaitCrypto/Aura/issues"
+
+[tool.setuptools.dynamic]
+version = { attr = "aura.__version__" }
+
+[tool.setuptools.packages.find]
+include = ["aura*"]
+
+[tool.setuptools.package-data]
+aura = [
+  "builtin/skills/**/*",
+  "runtime/knowledge/README.md",
+  "runtime/prompts/*.md",
+  "surfaces/*.stub",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["scripts/integration"]
+python_files = ["test_*.py"]
